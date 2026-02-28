@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.email=${OPENCLAW_ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/acme.json"
+      - "--certificatesresolvers.le.acme.dnschallenge=true"
+      - "--certificatesresolvers.le.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
+      - "--certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10"
+      - "--entrypoints.websecure.http.tls.certresolver=le"
+      - "--entrypoints.websecure.http.tls.domains[0].main=${OPENCLAW_WILDCARD_DOMAIN}"
+      - "--entrypoints.websecure.http.tls.domains[0].sans=*.${OPENCLAW_WILDCARD_DOMAIN}"
+    environment:
+      - CF_DNS_API_TOKEN=${OPENCLAW_CF_DNS_API_TOKEN}
+    ports:
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /opt/traefik/acme.json:/acme.json
+
+  openclaw-forward-auth:
+    build:
+      context: ../../docker/forward-auth
+    container_name: openclaw-forward-auth
+    restart: unless-stopped
+    environment:
+      - OPENCLAW_TTYD_SECRET=${OPENCLAW_TTYD_SECRET}
+      - OPENCLAW_TTYD_TTL_SECONDS=${OPENCLAW_TTYD_TTL_SECONDS:-86400}
+    labels:
+      - "traefik.enable=false"
+
+networks:
+  default:
+    name: traefik_default
