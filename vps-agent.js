@@ -335,6 +335,56 @@ async function autoRegisterWithControlPlane() {
     }
 }
 
+const OPENCLAW_BIN = '/home/node/.npm-global/bin/openclaw';
+
+function runDockerExec(containerName, args, stdinData) {
+    return new Promise((resolve, reject) => {
+        const proc = execFile('docker', ['exec', ...(stdinData ? ['-i'] : []), containerName, OPENCLAW_BIN, ...args]);
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        if (stdinData) { proc.stdin.write(stdinData); proc.stdin.end(); }
+        proc.on('close', code => {
+            if (code !== 0) reject(new Error((stderr || stdout).trim().slice(0, 500)));
+            else resolve((stdout || stderr).trim());
+        });
+    });
+}
+
+app.post('/api/internal/configure-provider', requireInternal, async (req, res) => {
+    const { instanceId, provider, token, expiresIn } = req.body;
+    if (!instanceId || !provider || !token) {
+        return res.status(400).json({ error: 'instanceId, provider, and token are required' });
+    }
+    const containerName = `openclaw-user_${instanceId}`;
+    try {
+        const args = ['models', 'auth', 'paste-token', '--provider', provider];
+        if (expiresIn) args.push('--expires-in', expiresIn);
+        const output = await runDockerExec(containerName, args, token);
+        console.log(`[vps-agent] configured provider ${provider} for ${instanceId}`);
+        res.json({ success: true, output });
+    } catch (err) {
+        console.error(`[vps-agent] configure-provider failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/internal/set-model', requireInternal, async (req, res) => {
+    const { instanceId, model } = req.body;
+    if (!instanceId || !model) {
+        return res.status(400).json({ error: 'instanceId and model are required' });
+    }
+    const containerName = `openclaw-user_${instanceId}`;
+    try {
+        const output = await runDockerExec(containerName, ['models', 'set', model]);
+        console.log(`[vps-agent] set model ${model} for ${instanceId}`);
+        res.json({ success: true, output });
+    } catch (err) {
+        console.error(`[vps-agent] set-model failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[vps-agent] port ${PORT}`);
     console.log(`[vps-agent] HOST_KIT_DIR=${HOST_KIT_DIR}`);
