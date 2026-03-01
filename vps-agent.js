@@ -344,6 +344,85 @@ function readInstanceConfig(instanceId) {
     try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
 }
 
+const wsDir = (instanceId) => path.join(INSTANCES_DIR, instanceId, 'workspace');
+
+// ── Soul ──────────────────────────────────────────────────────────────────────
+app.get('/api/internal/soul', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const p = path.join(wsDir(instanceId), 'SOUL.md');
+    try {
+        res.json({ content: fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '', path: '~/.openclaw/workspace/SOUL.md' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/internal/soul', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    const { content } = req.body || {};
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const p = path.join(wsDir(instanceId), 'SOUL.md');
+    try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, content || '', 'utf8');
+        res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Workspace files ───────────────────────────────────────────────────────────
+app.get('/api/internal/workspace-list', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const dir = wsDir(instanceId);
+    try {
+        const files = fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter(f => f.endsWith('.md') && f !== 'SOUL.md')
+            : [];
+        res.json({ files });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/internal/workspace-file', requireInternal, (req, res) => {
+    const { instanceId, name } = req.query;
+    if (!instanceId || !name) return res.status(400).json({ error: 'instanceId and name required' });
+    const safeName = path.basename(name);
+    const p = path.join(wsDir(instanceId), safeName);
+    try {
+        res.json({ content: fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '', path: `~/.openclaw/workspace/${safeName}` });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/internal/workspace-file', requireInternal, (req, res) => {
+    const { instanceId, name } = req.query;
+    const { content } = req.body || {};
+    if (!instanceId || !name) return res.status(400).json({ error: 'instanceId and name required' });
+    const safeName = path.basename(name);
+    const p = path.join(wsDir(instanceId), safeName);
+    try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, content || '', 'utf8');
+        res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── openclaw-config write ─────────────────────────────────────────────────────
+app.put('/api/internal/openclaw-config', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    const { content } = req.body || {};
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
+    try {
+        const incoming = JSON.parse(content);
+        const existing = readInstanceConfig(instanceId) || {};
+        // Preserve sensitive gateway.auth fields
+        if (existing.gateway?.auth) {
+            incoming.gateway = incoming.gateway || {};
+            incoming.gateway.auth = existing.gateway.auth;
+        }
+        fs.writeFileSync(configPath, JSON.stringify(incoming, null, 2), 'utf8');
+        res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/internal/model-config', requireInternal, (req, res) => {
     const { instanceId } = req.query;
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
@@ -362,10 +441,10 @@ app.get('/api/internal/openclaw-config', requireInternal, (req, res) => {
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
     const config = readInstanceConfig(instanceId);
     if (!config) return res.status(404).json({ error: 'Config not found' });
-    // Strip sensitive fields before returning
     const safe = JSON.parse(JSON.stringify(config));
     if (safe.gateway?.auth?.token) safe.gateway.auth.token = '[redacted]';
-    res.json(safe);
+    const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
+    res.json({ content: JSON.stringify(safe, null, 2), path: configPath });
 });
 
 function runDockerExec(containerName, args, stdinData) {
