@@ -336,6 +336,37 @@ async function autoRegisterWithControlPlane() {
 }
 
 const OPENCLAW_BIN = '/home/node/.npm-global/bin/openclaw';
+const INSTANCES_DIR = '/var/lib/openclaw/instances';
+
+function readInstanceConfig(instanceId) {
+    const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return null;
+    try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
+}
+
+app.get('/api/internal/model-config', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const defaults = config.agents?.defaults || {};
+    const primary = defaults.model?.primary || '';
+    const modelsObj = defaults.models || {};
+    const allowedModels = Object.keys(modelsObj);
+    if (primary && !allowedModels.includes(primary)) allowedModels.push(primary);
+    res.json({ primary, allowedModels, fallbacks: [] });
+});
+
+app.get('/api/internal/openclaw-config', requireInternal, (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    // Strip sensitive fields before returning
+    const safe = JSON.parse(JSON.stringify(config));
+    if (safe.gateway?.auth?.token) safe.gateway.auth.token = '[redacted]';
+    res.json(safe);
+});
 
 function runDockerExec(containerName, args, stdinData) {
     return new Promise((resolve, reject) => {
