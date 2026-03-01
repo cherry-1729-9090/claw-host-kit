@@ -42,10 +42,11 @@ PIDS_LIMIT="${OPENCLAW_PIDS_LIMIT:-512}"
 mkdir -p "${DATA_DIR}"
 chown 1000:1000 "${DATA_DIR}"
 
-# Ensure the Docker network exists before starting the container
+# Ensure the Docker network exists — if missing, Traefik is likely not running yet.
 if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
-  echo "Docker network '${NETWORK}' not found — creating it..."
-  docker network create "${NETWORK}"
+  echo "ERROR: Docker network '${NETWORK}' not found." >&2
+  echo "Start Traefik first: docker compose -p traefik -f deploy/traefik/docker-compose.yml up -d" >&2
+  exit 1
 fi
 
 # If the container already exists, remove it so we can recreate cleanly
