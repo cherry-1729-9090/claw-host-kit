@@ -299,9 +299,46 @@ app.delete('/api/internal/remove-instance/:instanceId', requireInternal, async (
     }
 });
 
+async function autoRegisterWithControlPlane() {
+    const controlPlaneUrl = process.env.OPENCLAW_CONTROL_PLANE_URL;
+    if (!controlPlaneUrl || !INTERNAL_SECRET) {
+        console.warn('[vps-agent] skipping auto-register: OPENCLAW_CONTROL_PLANE_URL or INTERNAL_SECRET not set');
+        return;
+    }
+
+    try {
+        const ip = await shell("curl -sf https://api.ipify.org || curl -sf https://ifconfig.me");
+        if (!ip) { console.warn('[vps-agent] auto-register: could not determine public IP'); return; }
+
+        const body = {
+            ip,
+            shard: process.env.OPENCLAW_HOST_SHARD,
+            baseDomain: process.env.OPENCLAW_BASE_DOMAIN,
+            ttydSecret: process.env.OPENCLAW_TTYD_SECRET,
+        };
+
+        const res = await fetch(`${controlPlaneUrl}/api/webhooks/node-register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(15_000),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            console.log(`[vps-agent] auto-registered with control-plane (nodeId=${data.nodeId}, ip=${ip})`);
+        } else {
+            console.warn(`[vps-agent] auto-register failed: ${res.status} ${JSON.stringify(data)}`);
+        }
+    } catch (err) {
+        console.warn(`[vps-agent] auto-register error: ${err.message}`);
+    }
+}
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[vps-agent] port ${PORT}`);
     console.log(`[vps-agent] HOST_KIT_DIR=${HOST_KIT_DIR}`);
     console.log(`[vps-agent] INTERNAL_SECRET ${INTERNAL_SECRET ? 'set ✓' : 'NOT SET — all requests will be rejected!'}`);
     console.log(`[vps-agent] RUNTIME_IMAGE=${process.env.OPENCLAW_RUNTIME_IMAGE || 'openclaw-ttyd:latest (default)'}`);
+    autoRegisterWithControlPlane();
 });

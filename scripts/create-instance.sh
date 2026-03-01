@@ -42,6 +42,12 @@ PIDS_LIMIT="${OPENCLAW_PIDS_LIMIT:-512}"
 mkdir -p "${DATA_DIR}"
 chown 1000:1000 "${DATA_DIR}"
 
+# Ensure the Docker network exists before starting the container
+if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
+  echo "Docker network '${NETWORK}' not found — creating it..."
+  docker network create "${NETWORK}"
+fi
+
 docker pull "${OPENCLAW_RUNTIME_IMAGE}" >/dev/null 2>&1 || true
 
 docker run -d \
