@@ -134,6 +134,7 @@ cleanup() {
 
 ensure_gateway_token
 ensure_silent_pairing
+openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true >/dev/null 2>&1 || true
 
 ttyd -p "${TTYD_PORT}" -W bash &
 ttyd_pid=$!
