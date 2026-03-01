@@ -356,7 +356,7 @@ app.post('/api/internal/configure-provider', requireInternal, async (req, res) =
     if (!instanceId || !provider || !token) {
         return res.status(400).json({ error: 'instanceId, provider, and token are required' });
     }
-    const containerName = `openclaw-user_${instanceId}`;
+    const containerName = `openclaw-${instanceId}`;
     try {
         const args = ['models', 'auth', 'paste-token', '--provider', provider];
         if (expiresIn) args.push('--expires-in', expiresIn);
@@ -374,7 +374,7 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
     if (!instanceId || !model) {
         return res.status(400).json({ error: 'instanceId and model are required' });
     }
-    const containerName = `openclaw-user_${instanceId}`;
+    const containerName = `openclaw-${instanceId}`;
     try {
         const output = await runDockerExec(containerName, ['models', 'set', model]);
         console.log(`[vps-agent] set model ${model} for ${instanceId}`);
