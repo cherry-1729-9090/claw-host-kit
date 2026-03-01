@@ -172,16 +172,21 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
     const { instanceId } = req.body;
     if (!validId(instanceId)) return res.status(400).json({ error: 'Invalid instanceId' });
 
+    console.log(`[vps-agent] create-instance request for instanceId=${instanceId}`);
+
     const scriptPath = path.join(HOST_KIT_DIR, 'scripts', 'create-instance.sh');
     if (!fs.existsSync(scriptPath)) {
+        console.error(`[vps-agent] create-instance.sh not found at ${scriptPath}`);
         return res.status(500).json({ error: `create-instance.sh not found at ${scriptPath}` });
     }
 
     try {
         const memRaw = await shell("free -m | awk 'NR==2{print $4}'");
         const freeMemMB = parseInt(memRaw, 10);
+        console.log(`[vps-agent] free memory: ${freeMemMB}MB, required: ${CONTAINER_RAM_LIMIT_MB}MB`);
 
         if (freeMemMB < CONTAINER_RAM_LIMIT_MB) {
+            console.warn(`[vps-agent] insufficient memory for ${instanceId}: free=${freeMemMB}MB required=${CONTAINER_RAM_LIMIT_MB}MB`);
             return res.status(507).json({
                 error: 'Insufficient memory',
                 freeMemMB,
@@ -189,6 +194,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             });
         }
 
+        console.log(`[vps-agent] running create-instance.sh for ${instanceId}...`);
         const output = await new Promise((resolve, reject) => {
             execFile('bash', [scriptPath, instanceId], {
                 cwd: HOST_KIT_DIR,
@@ -198,29 +204,54 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
                     OPENCLAW_CONTAINER_MEMORY: `${CONTAINER_RAM_LIMIT_MB}m`,
                 },
             }, (err, stdout, stderr) => {
-                if (err) return reject(new Error(`create-instance.sh: ${stderr || err.message}`));
+                if (err) {
+                    console.error(`[vps-agent] create-instance.sh failed for ${instanceId}:`, stderr || err.message);
+                    return reject(new Error(`create-instance.sh: ${stderr || err.message}`));
+                }
+                console.log(`[vps-agent] create-instance.sh stdout for ${instanceId}:\n${stdout}`);
                 resolve(stdout);
             });
         });
 
         const configPath = path.join(`/var/lib/openclaw/instances/${instanceId}`, 'openclaw.json');
+        console.log(`[vps-agent] polling for gateway token at ${configPath}...`);
         let gatewayToken = null;
-        try {
-            if (fs.existsSync(configPath)) {
-                gatewayToken = JSON.parse(fs.readFileSync(configPath, 'utf8'))?.gateway?.auth?.token || null;
-            }
-        } catch { /* not yet written */ }
 
-        return res.json({
+        // Poll for openclaw.json — the container writes it a few seconds after start
+        const TOKEN_POLL_TIMEOUT_MS = 45_000;
+        const TOKEN_POLL_INTERVAL_MS = 1_500;
+        const pollStart = Date.now();
+        while (Date.now() - pollStart < TOKEN_POLL_TIMEOUT_MS) {
+            try {
+                if (fs.existsSync(configPath)) {
+                    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                    const t = parsed?.gateway?.auth?.token;
+                    if (t && typeof t === 'string' && t.trim() && t !== 'null') {
+                        gatewayToken = t.trim();
+                        console.log(`[vps-agent] gateway token found for ${instanceId} after ${Math.round((Date.now() - pollStart) / 1000)}s`);
+                        break;
+                    }
+                }
+            } catch (e) { /* still being written */ }
+            await new Promise((r) => setTimeout(r, TOKEN_POLL_INTERVAL_MS));
+        }
+
+        if (!gatewayToken) {
+            console.warn(`[vps-agent] gateway token NOT found after ${TOKEN_POLL_TIMEOUT_MS / 1000}s for ${instanceId} — container may still be starting`);
+        }
+
+        const result = {
             ok: true,
             instanceId,
             containerName: `openclaw-${instanceId}`,
             gatewayToken,
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
-        });
+        };
+        console.log(`[vps-agent] create-instance done for ${instanceId}:`, JSON.stringify({ ...result, output: '[truncated]' }));
+        return res.json(result);
     } catch (err) {
-        console.error('[vps-agent] create-instance:', err);
+        console.error('[vps-agent] create-instance error:', err.message);
         return res.status(500).json({ error: err.message });
     }
 });
