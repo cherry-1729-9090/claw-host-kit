@@ -48,6 +48,12 @@ if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
   docker network create "${NETWORK}"
 fi
 
+# If the container already exists, remove it so we can recreate cleanly
+if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  echo "Container '${CONTAINER}' already exists — removing it..."
+  docker rm -f "${CONTAINER}"
+fi
+
 docker pull "${OPENCLAW_RUNTIME_IMAGE}" >/dev/null 2>&1 || true
 
 docker run -d \
