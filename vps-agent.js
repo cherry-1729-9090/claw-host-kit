@@ -4,13 +4,30 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load .env from the host-kit directory automatically if present
+const envFilePath = path.join(process.env.OPENCLAW_HOST_KIT_DIR || __dirname, '.env');
+if (fs.existsSync(envFilePath)) {
+    const lines = fs.readFileSync(envFilePath, 'utf8').split('\n');
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx === -1) continue;
+        const key = trimmed.slice(0, eqIdx).trim();
+        const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
+        if (key && !(key in process.env)) process.env[key] = val;
+    }
+    console.log(`[vps-agent] loaded env from ${envFilePath}`);
+}
+
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.VPS_AGENT_PORT || 4444;
 const INTERNAL_SECRET = process.env.OPENCLAW_INTERNAL_SECRET || '';
-const HOST_KIT_DIR = process.env.OPENCLAW_HOST_KIT_DIR
-    || path.dirname(fileURLToPath(import.meta.url));
+const HOST_KIT_DIR = process.env.OPENCLAW_HOST_KIT_DIR || __dirname;
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -194,6 +211,16 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             });
         }
 
+        // Verify the runtime image exists locally before attempting container creation
+        const runtimeImage = process.env.OPENCLAW_RUNTIME_IMAGE || 'openclaw-ttyd:latest';
+        try {
+            await run('docker', ['image', 'inspect', runtimeImage, '--format', '{{.Id}}']);
+        } catch {
+            const msg = `Docker image '${runtimeImage}' not found locally. Build it first: cd docker/openclaw-ttyd && docker build -t ${runtimeImage} .`;
+            console.error(`[vps-agent] ${msg}`);
+            return res.status(500).json({ error: msg });
+        }
+
         console.log(`[vps-agent] running create-instance.sh for ${instanceId}...`);
         const output = await new Promise((resolve, reject) => {
             execFile('bash', [scriptPath, instanceId], {
@@ -272,4 +299,9 @@ app.delete('/api/internal/remove-instance/:instanceId', requireInternal, async (
     }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`[vps-agent] port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[vps-agent] port ${PORT}`);
+    console.log(`[vps-agent] HOST_KIT_DIR=${HOST_KIT_DIR}`);
+    console.log(`[vps-agent] INTERNAL_SECRET ${INTERNAL_SECRET ? 'set ✓' : 'NOT SET — all requests will be rejected!'}`);
+    console.log(`[vps-agent] RUNTIME_IMAGE=${process.env.OPENCLAW_RUNTIME_IMAGE || 'openclaw-ttyd:latest (default)'}`);
+});
