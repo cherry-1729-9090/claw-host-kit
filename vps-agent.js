@@ -377,6 +377,9 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
     const containerName = `openclaw-${instanceId}`;
     try {
         const output = await runDockerExec(containerName, ['models', 'set', model]);
+        // Also register the model in the agents.defaults.models config so it appears in allowedModels
+        const configKey = `agents.defaults.models.${model.replace(/\//g, '.')}`;
+        await runDockerExec(containerName, ['config', 'set', configKey, '{}']).catch(() => {});
         console.log(`[vps-agent] set model ${model} for ${instanceId}`);
         res.json({ success: true, output });
     } catch (err) {
