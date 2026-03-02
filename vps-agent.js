@@ -560,7 +560,7 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
     }
 });
 
-// ── Sub-agent spawn (uses WebSocket JSON-RPC to gateway inside container) ─────
+// ── Sub-agent spawn (WebSocket with challenge-response auth to gateway) ───────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
     if (!instanceId || !task) {
@@ -575,31 +575,49 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const containerName = `openclaw-${instanceId}`;
     const taskPayload = JSON.stringify({ message: task, name: label || task.slice(0, 60), agentId: agentId || 'main' });
 
-    // Node 22 inside the container has built-in WebSocket.
-    // The gateway uses JSON-RPC over WebSocket for mutations.
+    // WebSocket script that:
+    // 1. Connects to gateway
+    // 2. Receives connect.challenge → responds with token auth
+    // 3. On auth success, sends task creation
+    // 4. Collects all responses, outputs them, and exits
     const script = `
-        const ws = new WebSocket('ws://localhost:18789?token=${gatewayToken}');
-        const timer = setTimeout(() => { process.stderr.write('timeout'); process.exit(1); }, 10000);
-        ws.addEventListener('open', () => {
-            ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks.create', params: ${taskPayload} }));
-        });
+        const results = [];
+        let authenticated = false;
+        const ws = new WebSocket('ws://localhost:18789');
+        const timer = setTimeout(() => { process.stdout.write(JSON.stringify({ error: 'timeout', messages: results })); process.exit(0); }, 12000);
         ws.addEventListener('message', (e) => {
-            process.stdout.write(typeof e.data === 'string' ? e.data : '');
-            clearTimeout(timer);
-            ws.close();
+            const msg = typeof e.data === 'string' ? e.data : '';
+            let parsed;
+            try { parsed = JSON.parse(msg); } catch { results.push(msg); return; }
+            if (parsed.event === 'connect.challenge') {
+                ws.send(JSON.stringify({ type: 'command', command: 'connect.auth', payload: { token: '${gatewayToken}', nonce: parsed.payload.nonce } }));
+                return;
+            }
+            if (parsed.event === 'connect.authenticated' || parsed.event === 'connect.ok' || parsed.event === 'connect.ready') {
+                authenticated = true;
+                ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks.create', params: ${taskPayload} }));
+                return;
+            }
+            results.push(parsed);
+            if (parsed.id === 1 || parsed.event === 'task.created') {
+                clearTimeout(timer);
+                process.stdout.write(JSON.stringify(parsed));
+                ws.close();
+            }
         });
         ws.addEventListener('error', (e) => {
-            process.stderr.write('WS error: ' + (e.message || 'connection failed'));
+            process.stdout.write(JSON.stringify({ error: 'ws_error', detail: e.message || 'connection failed', messages: results }));
             clearTimeout(timer);
-            process.exit(1);
+            process.exit(0);
         });
     `.replace(/\n\s+/g, ' ');
 
     try {
-        const output = await run('docker', ['exec', containerName, 'node', '-e', script], { timeout: 15_000 });
+        const output = await run('docker', ['exec', containerName, 'node', '-e', script], { timeout: 20_000 });
         let data;
         try { data = JSON.parse(output); } catch { data = { raw: output }; }
-        console.log(`[vps-agent] subagent task created for ${instanceId}:`, output.slice(0, 200));
+        console.log(`[vps-agent] subagent spawn for ${instanceId}:`, output.slice(0, 300));
+        if (data.error) return res.status(500).json(data);
         res.json(data);
     } catch (err) {
         console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
