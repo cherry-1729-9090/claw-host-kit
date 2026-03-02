@@ -560,7 +560,7 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
     }
 });
 
-// ── Sub-agent spawn (calls gateway REST API internally via node inside container) ──
+// ── Sub-agent spawn (uses WebSocket JSON-RPC to gateway inside container) ─────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
     if (!instanceId || !task) {
@@ -573,25 +573,33 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
     const containerName = `openclaw-${instanceId}`;
-    const payload = JSON.stringify({ task, label, model, agentId: agentId || 'main' });
+    const taskPayload = JSON.stringify({ message: task, name: label || task.slice(0, 60), agentId: agentId || 'main' });
 
-    // Use node inside the container to call the gateway's REST API on localhost
-    const script = [
-        `const r = await fetch('http://localhost:18789/api/tasks', {`,
-        `  method: 'POST',`,
-        `  headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ${gatewayToken}' },`,
-        `  body: ${JSON.stringify(payload)}`,
-        `});`,
-        `const t = await r.text();`,
-        `if (!r.ok) { process.stderr.write('HTTP ' + r.status + ': ' + t); process.exit(1); }`,
-        `process.stdout.write(t);`,
-    ].join(' ');
+    // Node 22 inside the container has built-in WebSocket.
+    // The gateway uses JSON-RPC over WebSocket for mutations.
+    const script = `
+        const ws = new WebSocket('ws://localhost:18789?token=${gatewayToken}');
+        const timer = setTimeout(() => { process.stderr.write('timeout'); process.exit(1); }, 10000);
+        ws.addEventListener('open', () => {
+            ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks.create', params: ${taskPayload} }));
+        });
+        ws.addEventListener('message', (e) => {
+            process.stdout.write(typeof e.data === 'string' ? e.data : '');
+            clearTimeout(timer);
+            ws.close();
+        });
+        ws.addEventListener('error', (e) => {
+            process.stderr.write('WS error: ' + (e.message || 'connection failed'));
+            clearTimeout(timer);
+            process.exit(1);
+        });
+    `.replace(/\n\s+/g, ' ');
 
     try {
         const output = await run('docker', ['exec', containerName, 'node', '-e', script], { timeout: 15_000 });
         let data;
         try { data = JSON.parse(output); } catch { data = { raw: output }; }
-        console.log(`[vps-agent] subagent spawned for ${instanceId}`);
+        console.log(`[vps-agent] subagent task created for ${instanceId}:`, output.slice(0, 200));
         res.json(data);
     } catch (err) {
         console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
