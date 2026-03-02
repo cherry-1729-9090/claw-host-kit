@@ -716,6 +716,57 @@ app.post('/api/internal/models-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Sessions list (WebSocket sessions.list → mapped to jobs) ─────────────────
+app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
+    const { instanceId, ids, limit, includeNarrative, includeLog } = req.body;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'sessions.list', {});
+        const sessions = result?.payload?.sessions || result?.payload || [];
+
+        // If specific IDs requested and includeNarrative, fetch previews
+        let jobs = [];
+        if (ids && includeNarrative) {
+            const idList = ids.split(',').map(s => s.trim());
+            for (const sessionKey of idList) {
+                try {
+                    const preview = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'sessions.preview', { sessionKey });
+                    jobs.push(mapSessionToJob(preview?.payload || {}, sessionKey));
+                } catch { jobs.push({ id: sessionKey, status: 'unknown' }); }
+            }
+        } else {
+            const list = Array.isArray(sessions) ? sessions : [];
+            jobs = list.slice(0, limit || 100).map(s => mapSessionToJob(s, s.key || s.sessionKey));
+        }
+
+        res.json({ jobs });
+    } catch (err) {
+        console.error(`[vps-agent] sessions-list failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message, jobs: [] });
+    }
+});
+
+function mapSessionToJob(session, key) {
+    return {
+        id: key || session.key || session.sessionKey || session.id,
+        name: session.title || session.name || key || 'Untitled',
+        status: session.status || 'assigned',
+        metadata: {
+            status: session.status || 'assigned',
+            agentId: session.agentId || 'main',
+            createdAt: session.createdAt || session.updatedAt,
+            updatedAt: session.updatedAt
+        },
+        narrative: session.narrative || session.preview || '',
+        log: session.log || []
+    };
+}
+
 // ── Chat send (generic WebSocket chat.send) ──────────────────────────────────
 app.post('/api/internal/chat-send', requireInternal, async (req, res) => {
     const { instanceId, sessionKey, message, idempotencyKey } = req.body;
