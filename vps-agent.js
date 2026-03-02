@@ -514,9 +514,13 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
         const provider = { baseUrl };
         if (apiKey) provider.apiKey = apiKey;
         if (api) provider.api = api === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
-        if (authHeader && authHeader !== 'Authorization') provider.authHeader = authHeader;
         if (headers && typeof headers === 'object') provider.headers = headers;
-        if (Array.isArray(models) && models.length) provider.models = models;
+        if (Array.isArray(models) && models.length) {
+            provider.models = models.map(m => ({
+                id: m.id || m,
+                name: m.name || m.id || String(m)
+            }));
+        }
 
         config.models.providers[key] = provider;
 
