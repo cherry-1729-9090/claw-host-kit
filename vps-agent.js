@@ -752,18 +752,31 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
 });
 
 function mapSessionToJob(session, key) {
+    const sessionKey = key || session.key || '';
+    const agentId = sessionKey.split(':')[1] || 'main';
+    const name = session.displayName || session.origin?.label || agentId;
+    // Derive status: if aborted → failed, if recently active → picked_up, else assigned
+    let status = 'assigned';
+    if (session.abortedLastRun) status = 'failed';
+    else if (session.updatedAt && (Date.now() - session.updatedAt < 60_000)) status = 'picked_up';
+
     return {
-        id: key || session.key || session.sessionKey || session.id,
-        name: session.title || session.name || key || 'Untitled',
-        status: session.status || 'assigned',
+        id: sessionKey,
+        name,
+        status,
+        agentId,
+        model: session.model ? `${session.modelProvider || ''}/${session.model}` : '',
         metadata: {
-            status: session.status || 'assigned',
-            agentId: session.agentId || 'main',
-            createdAt: session.createdAt || session.updatedAt,
-            updatedAt: session.updatedAt
+            status,
+            agentId,
+            createdAt: session.updatedAt,
+            updatedAt: session.updatedAt,
+            channel: session.lastChannel || session.origin?.provider || 'webchat',
+            inputTokens: session.inputTokens || 0,
+            outputTokens: session.outputTokens || 0
         },
-        narrative: session.narrative || session.preview || '',
-        log: session.log || []
+        narrative: session.displayName || `${name} via ${session.lastChannel || 'webchat'}`,
+        log: []
     };
 }
 
