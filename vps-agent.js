@@ -498,12 +498,28 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
     }
 });
 
+// ── Reserved provider keys that OpenClaw handles specially ─────────────────────
+// Using these as custom provider keys causes OpenClaw to override baseUrl/auth.
+const RESERVED_PROVIDER_KEYS = new Set([
+    'azure', 'openai', 'anthropic', 'google', 'github-copilot',
+    'openai-codex', 'opencode',
+]);
+
 // ── Custom provider config ────────────────────────────────────────────────────
 app.post('/api/internal/configure-custom-provider', requireInternal, async (req, res) => {
     const { instanceId, key, label, baseUrl, api, apiKey, authHeader, headers, models } = req.body;
     if (!instanceId || !key || !baseUrl) {
         return res.status(400).json({ error: 'instanceId, key, and baseUrl are required' });
     }
+
+    if (RESERVED_PROVIDER_KEYS.has(key)) {
+        return res.status(400).json({
+            error: `"${key}" is a reserved provider key that OpenClaw handles internally (it overrides your baseUrl and auth settings). Use a different key like "${key}v1" or "custom-${key}" instead.`,
+            code: 'RESERVED_KEY',
+            suggestedKey: `${key}v1`,
+        });
+    }
+
     try {
         const config = readInstanceConfig(instanceId);
         if (!config) return res.status(404).json({ error: 'Config not found' });
@@ -524,11 +540,56 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
 
         config.models.providers[key] = provider;
 
+        // Write auth-profiles.json so the gateway can find the API key
+        if (apiKey) {
+            const authDir = path.join(INSTANCES_DIR, instanceId, 'agents', 'main', 'agent');
+            fs.mkdirSync(authDir, { recursive: true });
+            const authPath = path.join(authDir, 'auth-profiles.json');
+            let authProfiles = {};
+            try { authProfiles = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch {}
+            authProfiles[key] = { apiKey };
+            fs.writeFileSync(authPath, JSON.stringify(authProfiles), 'utf8');
+        }
+
         writeInstanceConfig(instanceId, config);
         console.log(`[vps-agent] custom provider ${key} configured for ${instanceId}`);
-        res.json({ success: true });
+        res.json({ success: true, providerKey: key });
     } catch (err) {
         console.error(`[vps-agent] configure-custom-provider failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Sub-agent spawn (calls gateway REST API internally) ───────────────────────
+app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
+    const { instanceId, task, label, model, agentId } = req.body;
+    if (!instanceId || !task) {
+        return res.status(400).json({ error: 'instanceId and task are required' });
+    }
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    // Call the gateway's REST API from inside the host (bypasses Traefik)
+    const containerName = `openclaw-${instanceId}`;
+    try {
+        const body = JSON.stringify({ task, label, model, agentId: agentId || 'main' });
+        const args = [
+            'exec', containerName,
+            'curl', '-sf', '-X', 'POST',
+            'http://localhost:18789/api/tasks',
+            '-H', 'Content-Type: application/json',
+            '-H', `Authorization: Bearer ${gatewayToken}`,
+            '-d', body
+        ];
+        const output = await run('docker', args, { timeout: 15_000 });
+        const data = JSON.parse(output);
+        console.log(`[vps-agent] subagent spawned for ${instanceId}`);
+        res.json(data);
+    } catch (err) {
+        console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
     }
 });
