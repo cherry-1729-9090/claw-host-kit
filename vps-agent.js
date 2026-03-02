@@ -574,13 +574,13 @@ function getChannelStatusFromConfig(instanceId) {
 app.get('/api/internal/channels-status', requireInternal, (req, res) => {
     const { instanceId } = req.query;
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
-    res.json({ parsed: getChannelStatusFromConfig(instanceId) });
+    res.json({ parsed: { channels: getChannelStatusFromConfig(instanceId) } });
 });
 
 app.get('/api/internal/channels-list', requireInternal, (req, res) => {
     const { instanceId } = req.query;
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
-    res.json({ parsed: getChannelStatusFromConfig(instanceId) });
+    res.json({ parsed: { channels: getChannelStatusFromConfig(instanceId) } });
 });
 
 app.post('/api/internal/channels-login', requireInternal, (req, res) => {
