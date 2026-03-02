@@ -560,7 +560,7 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
     }
 });
 
-// ── Sub-agent spawn (calls gateway REST API internally) ───────────────────────
+// ── Sub-agent spawn (calls gateway REST API internally via node inside container) ──
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
     if (!instanceId || !task) {
@@ -572,20 +572,25 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const gatewayToken = config.gateway?.auth?.token;
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
-    // Call the gateway's REST API from inside the host (bypasses Traefik)
     const containerName = `openclaw-${instanceId}`;
+    const payload = JSON.stringify({ task, label, model, agentId: agentId || 'main' });
+
+    // Use node inside the container to call the gateway's REST API on localhost
+    const script = [
+        `const r = await fetch('http://localhost:18789/api/tasks', {`,
+        `  method: 'POST',`,
+        `  headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ${gatewayToken}' },`,
+        `  body: ${JSON.stringify(payload)}`,
+        `});`,
+        `const t = await r.text();`,
+        `if (!r.ok) { process.stderr.write('HTTP ' + r.status + ': ' + t); process.exit(1); }`,
+        `process.stdout.write(t);`,
+    ].join(' ');
+
     try {
-        const body = JSON.stringify({ task, label, model, agentId: agentId || 'main' });
-        const args = [
-            'exec', containerName,
-            'curl', '-sf', '-X', 'POST',
-            'http://localhost:18789/api/tasks',
-            '-H', 'Content-Type: application/json',
-            '-H', `Authorization: Bearer ${gatewayToken}`,
-            '-d', body
-        ];
-        const output = await run('docker', args, { timeout: 15_000 });
-        const data = JSON.parse(output);
+        const output = await run('docker', ['exec', containerName, 'node', '-e', script], { timeout: 15_000 });
+        let data;
+        try { data = JSON.parse(output); } catch { data = { raw: output }; }
         console.log(`[vps-agent] subagent spawned for ${instanceId}`);
         res.json(data);
     } catch (err) {
