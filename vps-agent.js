@@ -653,23 +653,47 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
     });
 });
 
-// ── Agent update (WebSocket agents.update) ───────────────────────────────────
-app.post('/api/internal/agents-update', requireInternal, async (req, res) => {
+// ── Agent config update (writes to openclaw.json + config.apply via WS) ──────
+app.post('/api/internal/agent-config-update', requireInternal, async (req, res) => {
     const { instanceId, agentId, updates } = req.body;
     if (!instanceId || !agentId) return res.status(400).json({ error: 'instanceId and agentId are required' });
-    const config = readInstanceConfig(instanceId);
-    if (!config) return res.status(404).json({ error: 'Config not found' });
-    const gatewayToken = config.gateway?.auth?.token;
-    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
+    let config;
+    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {
+        return res.status(404).json({ error: 'Config not found' });
+    }
+
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+
+    // For "main" agent, write to defaults. For others, write to agents.<id>
+    const target = agentId === 'main' ? config.agents.defaults : (config.agents.agents = config.agents.agents || {}, config.agents.agents[agentId] = config.agents.agents[agentId] || {}, config.agents.agents[agentId]);
+
+    if (updates.model) {
+        target.model = target.model || {};
+        if (updates.model.primary !== undefined) target.model.primary = updates.model.primary;
+        if (updates.model.fallbacks !== undefined) target.model.fallbacks = updates.model.fallbacks;
+    }
+    if (updates.identity) {
+        target.identity = target.identity || {};
+        if (updates.identity.name !== undefined) target.identity.name = updates.identity.name;
+        if (updates.identity.emoji !== undefined) target.identity.emoji = updates.identity.emoji;
+    }
 
     try {
-        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.update', {
-            agentId, ...updates
-        });
-        console.log(`[vps-agent] agent updated ${agentId} for ${instanceId}`);
-        res.json(result?.payload || result);
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+        console.log(`[vps-agent] agent config updated for ${agentId} in ${instanceId}`);
+
+        // Notify gateway to reload config
+        const gatewayToken = config.gateway?.auth?.token;
+        if (gatewayToken) {
+            gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'config.apply', {}).catch(() => {});
+        }
+
+        res.json({ ok: true, agent: { id: agentId, model: target.model, identity: target.identity } });
     } catch (err) {
-        console.error(`[vps-agent] agents-update failed for ${instanceId}:`, err.message);
+        console.error(`[vps-agent] agent-config-update write failed:`, err.message);
         res.status(500).json({ error: err.message });
     }
 });
