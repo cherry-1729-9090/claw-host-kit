@@ -746,9 +746,12 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const gatewayToken = config.gateway?.auth?.token;
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
+    const aid = agentId || 'main';
     try {
         const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'chat.send', {
-            text: task, agentId: agentId || 'main'
+            sessionKey: `agent:${aid}:${aid}`,
+            message: task,
+            idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
         });
         console.log(`[vps-agent] subagent spawn for ${instanceId}:`, JSON.stringify(result).slice(0, 300));
         if (result.error) return res.status(500).json(result);
