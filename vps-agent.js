@@ -498,6 +498,36 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
     }
 });
 
+// ── Custom provider config ────────────────────────────────────────────────────
+app.post('/api/internal/configure-custom-provider', requireInternal, async (req, res) => {
+    const { instanceId, key, label, baseUrl, api, authHeader, headers, models } = req.body;
+    if (!instanceId || !key || !baseUrl) {
+        return res.status(400).json({ error: 'instanceId, key, and baseUrl are required' });
+    }
+    try {
+        const config = readInstanceConfig(instanceId);
+        if (!config) return res.status(404).json({ error: 'Config not found' });
+
+        config.models = config.models || {};
+        config.models.providers = config.models.providers || {};
+
+        const provider = { baseUrl };
+        if (api) provider.api = api === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+        if (authHeader) provider.authHeader = authHeader;
+        if (headers && typeof headers === 'object') provider.headers = headers;
+        if (Array.isArray(models) && models.length) provider.models = models;
+
+        config.models.providers[key] = provider;
+
+        writeInstanceConfig(instanceId, config);
+        console.log(`[vps-agent] custom provider ${key} configured for ${instanceId}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(`[vps-agent] configure-custom-provider failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Channel management ────────────────────────────────────────────────────────
 
 function writeInstanceConfig(instanceId, config) {
