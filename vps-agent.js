@@ -734,9 +734,9 @@ app.post('/api/internal/agents-delete', requireInternal, async (req, res) => {
     }
 });
 
-// ── Sub-agent spawn (WebSocket chat.send to gateway) ─────────────────────────
+// ── Sub-agent spawn (agents.create + chat.send via WebSocket) ────────────────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
-    const { instanceId, task, label, model, agentId } = req.body;
+    const { instanceId, task, label, model } = req.body;
     if (!instanceId || !task) {
         return res.status(400).json({ error: 'instanceId and task are required' });
     }
@@ -746,16 +746,35 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const gatewayToken = config.gateway?.auth?.token;
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
-    const aid = agentId || 'main';
+    const container = `openclaw-${instanceId}`;
+    const agentId = (label || 'sub-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
+
     try {
-        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'chat.send', {
-            sessionKey: `agent:${aid}:${aid}`,
+        // Step 1: Create the agent
+        const createResult = await gatewayWsExec(container, gatewayToken, 'agents.create', {
+            id: agentId,
+            identity: { name: label || agentId, emoji: '🤖' },
+            ...(model ? { model: { primary: model } } : {})
+        });
+        console.log(`[vps-agent] agent created ${agentId}:`, JSON.stringify(createResult).slice(0, 200));
+
+        if (!createResult.ok && createResult.error) {
+            return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
+        }
+
+        // Step 2: Send the initial task message
+        const chatResult = await gatewayWsExec(container, gatewayToken, 'chat.send', {
+            sessionKey: `agent:${agentId}:${agentId}`,
             message: task,
             idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
         });
-        console.log(`[vps-agent] subagent spawn for ${instanceId}:`, JSON.stringify(result).slice(0, 300));
-        if (result.error) return res.status(500).json(result);
-        res.json(result);
+        console.log(`[vps-agent] chat.send to ${agentId}:`, JSON.stringify(chatResult).slice(0, 200));
+
+        res.json({
+            ok: true,
+            agent: { id: agentId, name: label || agentId },
+            chat: chatResult?.payload || chatResult
+        });
     } catch (err) {
         console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
