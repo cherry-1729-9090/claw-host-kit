@@ -716,6 +716,32 @@ app.post('/api/internal/models-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Chat send (generic WebSocket chat.send) ──────────────────────────────────
+app.post('/api/internal/chat-send', requireInternal, async (req, res) => {
+    const { instanceId, sessionKey, message, idempotencyKey } = req.body;
+    if (!instanceId || !sessionKey || !message) {
+        return res.status(400).json({ error: 'instanceId, sessionKey, and message are required' });
+    }
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'chat.send', {
+            sessionKey,
+            message,
+            idempotencyKey: idempotencyKey || `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        });
+        console.log(`[vps-agent] chat.send to ${sessionKey}:`, JSON.stringify(result).slice(0, 200));
+        if (result.error && !result.ok) return res.status(400).json(result);
+        res.json(result?.payload || result);
+    } catch (err) {
+        console.error(`[vps-agent] chat-send failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Agent delete (WebSocket agents.delete) ───────────────────────────────────
 app.post('/api/internal/agents-delete', requireInternal, async (req, res) => {
     const { instanceId, agentId } = req.body;
