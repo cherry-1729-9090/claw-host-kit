@@ -752,9 +752,8 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     try {
         // Step 1: Create the agent
         const createResult = await gatewayWsExec(container, gatewayToken, 'agents.create', {
-            id: agentId,
-            identity: { name: label || agentId, emoji: '🤖' },
-            ...(model ? { model: { primary: model } } : {})
+            name: agentId,
+            workspace: `/home/node/.openclaw/agents/${agentId}`
         });
         console.log(`[vps-agent] agent created ${agentId}:`, JSON.stringify(createResult).slice(0, 200));
 
