@@ -625,6 +625,45 @@ app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Agent update (WebSocket agents.update) ───────────────────────────────────
+app.post('/api/internal/agents-update', requireInternal, async (req, res) => {
+    const { instanceId, agentId, updates } = req.body;
+    if (!instanceId || !agentId) return res.status(400).json({ error: 'instanceId and agentId are required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.update', {
+            agentId, ...updates
+        });
+        console.log(`[vps-agent] agent updated ${agentId} for ${instanceId}`);
+        res.json(result?.payload || result);
+    } catch (err) {
+        console.error(`[vps-agent] agents-update failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Models list (WebSocket models.list) ──────────────────────────────────────
+app.post('/api/internal/models-list', requireInternal, async (req, res) => {
+    const { instanceId } = req.body;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'models.list', {});
+        res.json(result?.payload || result);
+    } catch (err) {
+        console.error(`[vps-agent] models-list failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Sub-agent spawn (WebSocket chat.send to gateway) ─────────────────────────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
