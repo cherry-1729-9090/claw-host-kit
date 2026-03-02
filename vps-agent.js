@@ -498,6 +498,80 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
     }
 });
 
+// ── Channel management ────────────────────────────────────────────────────────
+
+app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
+    const { instanceId, channel, token, slackBotToken, slackAppToken } = req.body;
+    if (!instanceId || !channel) {
+        return res.status(400).json({ error: 'instanceId and channel are required' });
+    }
+    const containerName = `openclaw-${instanceId}`;
+    try {
+        const args = ['channels', 'add', '--channel', channel];
+        if (channel === 'slack') {
+            if (slackBotToken) args.push('--token', slackBotToken);
+            if (slackAppToken) args.push('--app-token', slackAppToken);
+        } else if (token) {
+            args.push('--token', token);
+        }
+        const output = await runDockerExec(containerName, args);
+        console.log(`[vps-agent] channels add ${channel} for ${instanceId}`);
+        res.json({ success: true, output });
+    } catch (err) {
+        console.error(`[vps-agent] channels-add failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/internal/channels-status', requireInternal, async (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const containerName = `openclaw-${instanceId}`;
+    try {
+        const output = await runDockerExec(containerName, ['channels', 'status']);
+        try { res.json({ parsed: JSON.parse(output) }); }
+        catch { res.json({ stdout: output }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/internal/channels-list', requireInternal, async (req, res) => {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
+    const containerName = `openclaw-${instanceId}`;
+    try {
+        const output = await runDockerExec(containerName, ['channels', 'list']);
+        try { res.json({ parsed: JSON.parse(output) }); }
+        catch { res.json({ stdout: output }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/internal/channels-login', requireInternal, (req, res) => {
+    const { instanceId, channel, verbose } = req.body;
+    if (!instanceId || !channel) {
+        return res.status(400).json({ error: 'instanceId and channel are required' });
+    }
+    const containerName = `openclaw-${instanceId}`;
+    const args = ['channels', 'login', '--channel', channel];
+    if (verbose) args.push('--verbose');
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    const proc = execFile('docker', ['exec', containerName, OPENCLAW_BIN, ...args], { timeout: 120_000 });
+    proc.stdout.on('data', (chunk) => res.write(chunk));
+    proc.stderr.on('data', (chunk) => res.write(chunk));
+    proc.on('close', () => res.end());
+    proc.on('error', (err) => {
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+        else res.end();
+    });
+    req.on('close', () => proc.kill());
+});
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[vps-agent] port ${PORT}`);
     console.log(`[vps-agent] HOST_KIT_DIR=${HOST_KIT_DIR}`);
