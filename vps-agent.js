@@ -625,6 +625,34 @@ app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Agent config read (from openclaw.json) ───────────────────────────────────
+app.post('/api/internal/agent-config', requireInternal, (req, res) => {
+    const { instanceId, agentId } = req.body;
+    if (!instanceId || !agentId) return res.status(400).json({ error: 'instanceId and agentId required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+
+    const defaults = config.agents?.defaults || {};
+    const agentOverrides = config.agents?.agents?.[agentId] || {};
+
+    // Merge defaults + agent-specific overrides
+    const model = agentOverrides.model || defaults.model || {};
+    const identity = agentOverrides.identity || defaults.identity || {};
+
+    res.json({
+        id: agentId,
+        agentId,
+        model: typeof model === 'string' ? model : {
+            primary: model.primary || '',
+            fallbacks: model.fallbacks || []
+        },
+        identity: {
+            name: identity.name || '',
+            emoji: identity.emoji || ''
+        }
+    });
+});
+
 // ── Agent update (WebSocket agents.update) ───────────────────────────────────
 app.post('/api/internal/agents-update', requireInternal, async (req, res) => {
     const { instanceId, agentId, updates } = req.body;
