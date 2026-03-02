@@ -591,7 +591,7 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
                     type: 'req', method: 'connect', id: '${connectId}',
                     params: {
                         minProtocol: 3, maxProtocol: 3,
-                        client: { id: 'openclaw-ui', version: 'dev', platform: 'linux', mode: 'backend' },
+                        client: { id: 'gateway-client', version: 'dev', platform: 'linux', mode: 'backend' },
                         caps: [], auth: { token: '${gatewayToken}' },
                         role: 'operator', scopes: ['operator.admin']
                     }
