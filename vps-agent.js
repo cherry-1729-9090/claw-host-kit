@@ -664,6 +664,24 @@ app.post('/api/internal/models-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Agent delete (WebSocket agents.delete) ───────────────────────────────────
+app.post('/api/internal/agents-delete', requireInternal, async (req, res) => {
+    const { instanceId, agentId } = req.body;
+    if (!instanceId || !agentId) return res.status(400).json({ error: 'instanceId and agentId are required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.delete', { agentId });
+        res.json(result?.payload || { ok: true });
+    } catch (err) {
+        console.error(`[vps-agent] agents-delete failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Sub-agent spawn (WebSocket chat.send to gateway) ─────────────────────────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
