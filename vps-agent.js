@@ -500,7 +500,7 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
 
 // ── Custom provider config ────────────────────────────────────────────────────
 app.post('/api/internal/configure-custom-provider', requireInternal, async (req, res) => {
-    const { instanceId, key, label, baseUrl, api, authHeader, headers, models } = req.body;
+    const { instanceId, key, label, baseUrl, api, apiKey, authHeader, headers, models } = req.body;
     if (!instanceId || !key || !baseUrl) {
         return res.status(400).json({ error: 'instanceId, key, and baseUrl are required' });
     }
@@ -512,8 +512,9 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
         config.models.providers = config.models.providers || {};
 
         const provider = { baseUrl };
+        if (apiKey) provider.apiKey = apiKey;
         if (api) provider.api = api === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
-        if (authHeader) provider.authHeader = authHeader;
+        if (authHeader && authHeader !== 'Authorization') provider.authHeader = authHeader;
         if (headers && typeof headers === 'object') provider.headers = headers;
         if (Array.isArray(models) && models.length) provider.models = models;
 
