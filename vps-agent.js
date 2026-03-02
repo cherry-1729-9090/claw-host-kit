@@ -554,30 +554,56 @@ app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
     }
 });
 
+function getChannelStatusFromConfig(instanceId) {
+    const config = readInstanceConfig(instanceId);
+    if (!config?.channels) return {};
+    const result = {};
+    for (const [ch, cfg] of Object.entries(config.channels)) {
+        if (cfg && typeof cfg === 'object') {
+            const hasToken = !!(cfg.botToken || cfg.token);
+            result[ch] = {
+                enabled: !!cfg.enabled,
+                configured: cfg.enabled && hasToken,
+                status: cfg.enabled && hasToken ? 'configured' : cfg.enabled ? 'enabled (no token)' : 'disabled'
+            };
+        }
+    }
+    return result;
+}
+
 app.get('/api/internal/channels-status', requireInternal, async (req, res) => {
     const { instanceId } = req.query;
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
     const containerName = `openclaw-${instanceId}`;
+
+    // Try CLI first, fall back to reading config
+    let cliResult = null;
     try {
         const output = await runDockerExec(containerName, ['channels', 'status']);
-        try { res.json({ parsed: JSON.parse(output) }); }
-        catch { res.json({ stdout: output }); }
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        try { cliResult = JSON.parse(output); } catch { cliResult = null; }
+    } catch { /* CLI may not support this */ }
+
+    const configStatus = getChannelStatusFromConfig(instanceId);
+
+    // Merge: CLI data takes priority, config fills gaps
+    const merged = { ...configStatus, ...(cliResult || {}) };
+    res.json({ parsed: merged });
 });
 
 app.get('/api/internal/channels-list', requireInternal, async (req, res) => {
     const { instanceId } = req.query;
     if (!instanceId) return res.status(400).json({ error: 'instanceId required' });
     const containerName = `openclaw-${instanceId}`;
+
+    let cliResult = null;
     try {
         const output = await runDockerExec(containerName, ['channels', 'list']);
-        try { res.json({ parsed: JSON.parse(output) }); }
-        catch { res.json({ stdout: output }); }
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+        try { cliResult = JSON.parse(output); } catch { cliResult = null; }
+    } catch { /* CLI may not support this */ }
+
+    const configStatus = getChannelStatusFromConfig(instanceId);
+    const merged = { ...configStatus, ...(cliResult || {}) };
+    res.json({ parsed: merged });
 });
 
 app.post('/api/internal/channels-login', requireInternal, (req, res) => {
