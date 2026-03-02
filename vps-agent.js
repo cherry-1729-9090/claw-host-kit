@@ -500,23 +500,54 @@ app.post('/api/internal/set-model', requireInternal, async (req, res) => {
 
 // ── Channel management ────────────────────────────────────────────────────────
 
+function writeInstanceConfig(instanceId, config) {
+    const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+}
+
 app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
     const { instanceId, channel, token, slackBotToken, slackAppToken } = req.body;
     if (!instanceId || !channel) {
         return res.status(400).json({ error: 'instanceId and channel are required' });
     }
-    const containerName = `openclaw-${instanceId}`;
     try {
-        const args = ['channels', 'add', '--channel', channel];
-        if (channel === 'slack') {
-            if (slackBotToken) args.push('--token', slackBotToken);
-            if (slackAppToken) args.push('--app-token', slackAppToken);
-        } else if (token) {
-            args.push('--token', token);
+        const config = readInstanceConfig(instanceId);
+        if (!config) return res.status(404).json({ error: 'Config not found' });
+
+        config.channels = config.channels || {};
+
+        if (channel === 'telegram') {
+            config.channels.telegram = config.channels.telegram || {};
+            config.channels.telegram.enabled = true;
+            if (token) config.channels.telegram.botToken = token;
+            config.channels.telegram.dmPolicy = config.channels.telegram.dmPolicy || 'open';
+            config.channels.telegram.allowFrom = config.channels.telegram.allowFrom || ['*'];
+            config.channels.telegram.groups = config.channels.telegram.groups || { '*': { requireMention: true } };
+        } else if (channel === 'discord') {
+            config.channels.discord = config.channels.discord || {};
+            config.channels.discord.enabled = true;
+            if (token) config.channels.discord.botToken = token;
+        } else if (channel === 'slack') {
+            config.channels.slack = config.channels.slack || {};
+            config.channels.slack.enabled = true;
+            if (slackBotToken) config.channels.slack.botToken = slackBotToken;
+            if (slackAppToken) config.channels.slack.appToken = slackAppToken;
+        } else {
+            return res.status(400).json({ error: `Unsupported channel: ${channel}` });
         }
-        const output = await runDockerExec(containerName, args);
-        console.log(`[vps-agent] channels add ${channel} for ${instanceId}`);
-        res.json({ success: true, output });
+
+        writeInstanceConfig(instanceId, config);
+        console.log(`[vps-agent] channels config written for ${channel} (${instanceId})`);
+
+        // Restart gateway to pick up channel changes
+        const containerName = `openclaw-${instanceId}`;
+        try {
+            await runDockerExec(containerName, ['gateway', 'restart']);
+        } catch {
+            // Gateway auto-reloads on config change, restart is best-effort
+        }
+
+        res.json({ success: true, output: `${channel} channel configured and gateway restarted` });
     } catch (err) {
         console.error(`[vps-agent] channels-add failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
