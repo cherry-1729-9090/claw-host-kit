@@ -560,7 +560,72 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
     }
 });
 
-// ── Sub-agent spawn (WebSocket with challenge-response auth to gateway) ───────
+// ── Helper: run a WebSocket method against the gateway inside a container ─────
+function gatewayWsExec(containerName, gatewayToken, method, params, timeoutMs = 12000) {
+    const connId = 'conn-' + Date.now();
+    const reqId = 'req-' + Date.now();
+    const paramsJson = JSON.stringify(params);
+    const script = `
+        let authenticated = false;
+        const ws = new WebSocket('ws://localhost:18789');
+        const timer = setTimeout(() => { process.stdout.write(JSON.stringify({ error: 'timeout' })); process.exit(0); }, ${timeoutMs});
+        ws.addEventListener('message', (e) => {
+            let parsed;
+            try { parsed = JSON.parse(typeof e.data === 'string' ? e.data : ''); } catch { return; }
+            if (parsed.event === 'connect.challenge') {
+                ws.send(JSON.stringify({
+                    type: 'req', method: 'connect', id: '${connId}',
+                    params: {
+                        minProtocol: 3, maxProtocol: 3,
+                        client: { id: 'gateway-client', version: 'dev', platform: 'linux', mode: 'backend' },
+                        caps: [], auth: { token: '${gatewayToken}' },
+                        role: 'operator', scopes: ['operator.admin']
+                    }
+                }));
+                return;
+            }
+            if (parsed.id === '${connId}' && !authenticated) {
+                authenticated = true;
+                ws.send(JSON.stringify({ type: 'req', method: '${method}', id: '${reqId}', params: ${paramsJson} }));
+                return;
+            }
+            if (authenticated && parsed.id === '${reqId}') {
+                clearTimeout(timer);
+                process.stdout.write(JSON.stringify(parsed));
+                ws.close();
+            }
+        });
+        ws.addEventListener('error', (e) => {
+            process.stdout.write(JSON.stringify({ error: 'ws_error', detail: e.message || 'connection failed' }));
+            clearTimeout(timer);
+            process.exit(0);
+        });
+    `.replace(/\n\s+/g, ' ');
+
+    return run('docker', ['exec', containerName, 'node', '-e', script], { timeout: timeoutMs + 5000 })
+        .then(output => { try { return JSON.parse(output); } catch { return { raw: output }; } });
+}
+
+// ── Agents list (WebSocket agents.list) ──────────────────────────────────────
+app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
+    const { instanceId } = req.body;
+    if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.list', {});
+        const agents = result?.payload?.agents || result?.payload || [];
+        res.json({ agents: Array.isArray(agents) ? agents : [] });
+    } catch (err) {
+        console.error(`[vps-agent] agents-list failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Sub-agent spawn (WebSocket chat.send to gateway) ─────────────────────────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const { instanceId, task, label, model, agentId } = req.body;
     if (!instanceId || !task) {
@@ -572,59 +637,13 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const gatewayToken = config.gateway?.auth?.token;
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
-    const containerName = `openclaw-${instanceId}`;
-    const taskPayload = JSON.stringify({ message: task, name: label || task.slice(0, 60), agentId: agentId || 'main' });
-
-    const connectId = 'conn-' + Date.now();
-    const taskId = 'task-' + Date.now();
-    const script = `
-        const results = [];
-        let authenticated = false;
-        const ws = new WebSocket('ws://localhost:18789');
-        const timer = setTimeout(() => { process.stdout.write(JSON.stringify({ error: 'timeout', messages: results })); process.exit(0); }, 12000);
-        ws.addEventListener('message', (e) => {
-            const msg = typeof e.data === 'string' ? e.data : '';
-            let parsed;
-            try { parsed = JSON.parse(msg); } catch { results.push(msg); return; }
-            if (parsed.event === 'connect.challenge') {
-                ws.send(JSON.stringify({
-                    type: 'req', method: 'connect', id: '${connectId}',
-                    params: {
-                        minProtocol: 3, maxProtocol: 3,
-                        client: { id: 'gateway-client', version: 'dev', platform: 'linux', mode: 'backend' },
-                        caps: [], auth: { token: '${gatewayToken}' },
-                        role: 'operator', scopes: ['operator.admin']
-                    }
-                }));
-                return;
-            }
-            if (parsed.id === '${connectId}' && !authenticated) {
-                authenticated = true;
-                ws.send(JSON.stringify({ type: 'req', method: 'tasks.create', id: '${taskId}', params: ${taskPayload} }));
-                return;
-            }
-            if (authenticated && parsed.id === '${taskId}') {
-                clearTimeout(timer);
-                process.stdout.write(JSON.stringify(parsed));
-                ws.close();
-                return;
-            }
-            results.push(parsed);
-        });
-        ws.addEventListener('error', (e) => {
-            process.stdout.write(JSON.stringify({ error: 'ws_error', detail: e.message || 'connection failed', messages: results }));
-            clearTimeout(timer);
-            process.exit(0);
-        });
-    `.replace(/\n\s+/g, ' ');
-
     try {
-        const output = await run('docker', ['exec', containerName, 'node', '-e', script], { timeout: 20_000 });
-        let data;
-        try { data = JSON.parse(output); } catch { data = { raw: output }; }
-        console.log(`[vps-agent] subagent spawn for ${instanceId}:`, output.slice(0, 300));
-        if (data.error) return res.status(500).json(data);
-        res.json(data);
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'chat.send', {
+            text: task, agentId: agentId || 'main'
+        });
+        console.log(`[vps-agent] subagent spawn for ${instanceId}:`, JSON.stringify(result).slice(0, 300));
+        if (result.error) return res.status(500).json(result);
+        res.json(result);
     } catch (err) {
         console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
