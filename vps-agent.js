@@ -575,11 +575,8 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
     const containerName = `openclaw-${instanceId}`;
     const taskPayload = JSON.stringify({ message: task, name: label || task.slice(0, 60), agentId: agentId || 'main' });
 
-    // WebSocket script that:
-    // 1. Connects to gateway
-    // 2. Receives connect.challenge → responds with token auth
-    // 3. On auth success, sends task creation
-    // 4. Collects all responses, outputs them, and exits
+    const connectId = 'conn-' + Date.now();
+    const taskId = 'task-' + Date.now();
     const script = `
         const results = [];
         let authenticated = false;
@@ -590,20 +587,29 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
             let parsed;
             try { parsed = JSON.parse(msg); } catch { results.push(msg); return; }
             if (parsed.event === 'connect.challenge') {
-                ws.send(JSON.stringify({ type: 'command', command: 'connect.auth', payload: { token: '${gatewayToken}', nonce: parsed.payload.nonce } }));
+                ws.send(JSON.stringify({
+                    type: 'req', method: 'connect', id: '${connectId}',
+                    params: {
+                        minProtocol: 3, maxProtocol: 3,
+                        client: { id: 'openclaw-ui', version: 'dev', platform: 'linux', mode: 'backend' },
+                        caps: [], auth: { token: '${gatewayToken}' },
+                        role: 'operator', scopes: ['operator.admin']
+                    }
+                }));
                 return;
             }
-            if (parsed.event === 'connect.authenticated' || parsed.event === 'connect.ok' || parsed.event === 'connect.ready') {
+            if (parsed.id === '${connectId}' && !authenticated) {
                 authenticated = true;
-                ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks.create', params: ${taskPayload} }));
+                ws.send(JSON.stringify({ type: 'req', method: 'tasks.create', id: '${taskId}', params: ${taskPayload} }));
                 return;
             }
-            results.push(parsed);
-            if (parsed.id === 1 || parsed.event === 'task.created') {
+            if (authenticated && parsed.id === '${taskId}') {
                 clearTimeout(timer);
                 process.stdout.write(JSON.stringify(parsed));
                 ws.close();
+                return;
             }
+            results.push(parsed);
         });
         ws.addEventListener('error', (e) => {
             process.stdout.write(JSON.stringify({ error: 'ws_error', detail: e.message || 'connection failed', messages: results }));
