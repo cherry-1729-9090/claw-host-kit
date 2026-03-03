@@ -811,13 +811,17 @@ function extractContent(content) {
 function mapSessionToJob(session, key) {
     const sessionKey = key || session.key || '';
     const agentId = sessionKey.split(':')[1] || 'main';
-    const name = session.displayName || session.origin?.label || agentId;
+    // Extract task ID from key like "agent:main:task-1234-abc" 
+    const sessionPart = sessionKey.split(':')[2] || '';
+    const isUiTask = sessionPart.startsWith('task-') || sessionPart.startsWith('bcast-');
+    const name = session.displayName || session.origin?.label || (isUiTask ? sessionPart : agentId);
+
     let status = 'assigned';
     if (session.abortedLastRun) status = 'failed';
     else if (session.updatedAt && (Date.now() - session.updatedAt < 60_000)) status = 'picked_up';
+    else if (session.outputTokens > 0) status = 'completed';
 
     const createdAt = session.updatedAt ? new Date(session.updatedAt).toISOString() : undefined;
-    const updatedAt = createdAt;
 
     return {
         id: session.sessionId || sessionKey,
@@ -831,7 +835,7 @@ function mapSessionToJob(session, key) {
             agentId,
             priority: 3,
             createdAt,
-            updatedAt,
+            updatedAt: createdAt,
             message: '',
             channel: session.lastChannel || session.origin?.provider || 'webchat',
             inputTokens: session.inputTokens || 0,
