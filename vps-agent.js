@@ -735,63 +735,34 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
         const list = Array.isArray(sessions) ? sessions : [];
 
         let jobs = [];
+        let sessionsToEnrich = [];
 
         if (ids) {
-            // Specific session(s) requested -- fetch chat history for detail
+            // Specific session(s) requested -- match by sessionId or key
             const idList = ids.split(',').map(s => s.trim());
-            for (const sessionKey of idList) {
-                const session = list.find(s => s.key === sessionKey) || {};
-                const job = mapSessionToJob(session, sessionKey);
-
-                if (includeNarrative || includeLog) {
-                    try {
-                        const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey });
-                        const messages = history?.payload?.messages || history?.payload || [];
-                        if (Array.isArray(messages) && messages.length) {
-                            const firstUser = messages.find(m => m.role === 'user');
-                            const lastMsg = messages[messages.length - 1];
-                            const taskMessage = firstUser ? extractContent(firstUser.content) : '';
-
-                            job.name = taskMessage ? `Task: ${taskMessage.slice(0, 60)}` : job.name;
-                            job.payload = { message: taskMessage };
-                            job.metadata.message = taskMessage;
-
-                            if (messages[0]?.timestamp) job.metadata.createdAt = new Date(messages[0].timestamp).toISOString();
-                            if (lastMsg?.timestamp) job.metadata.updatedAt = new Date(lastMsg.timestamp).toISOString();
-
-                            // Last assistant response as lastRun
-                            const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
-                            if (lastAssistant) {
-                                const aText = extractContent(lastAssistant.content);
-                                job.metadata.lastRun = {
-                                    status: lastAssistant.stopReason === 'error' ? 'failed' : 'completed',
-                                    ts: lastAssistant.timestamp ? new Date(lastAssistant.timestamp).toISOString() : undefined,
-                                    error: lastAssistant.errorMessage || undefined,
-                                    summary: aText.slice(0, 500) || undefined
-                                };
-                            }
-
-                            // narrative: array of {ts, role, agentId, text}
-                            job.metadata.narrative = messages.map(m => ({
-                                ts: m.timestamp ? new Date(m.timestamp).toISOString() : '',
-                                role: m.role || '',
-                                agentId: job.agentId,
-                                text: extractContent(m.content).slice(0, 500)
-                            }));
-
-                            // log: array of plain strings
-                            job.metadata.log = messages.map(m => {
-                                const text = extractContent(m.content);
-                                return `[${m.role || '?'}] ${text}`;
-                            });
-                        }
-                    } catch { /* keep basic info */ }
-                }
-
-                jobs.push(job);
+            for (const id of idList) {
+                const session = list.find(s => s.sessionId === id || s.key === id) || {};
+                const key = session.key || id;
+                sessionsToEnrich.push({ session, key });
             }
         } else {
-            jobs = list.slice(0, limit || 100).map(s => mapSessionToJob(s, s.key || s.sessionKey));
+            sessionsToEnrich = list.slice(0, limit || 100).map(s => ({ session: s, key: s.key || s.sessionKey }));
+        }
+
+        for (const { session, key } of sessionsToEnrich) {
+            const job = mapSessionToJob(session, key);
+
+            if (includeNarrative || includeLog || ids) {
+                try {
+                    const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey: key });
+                    const messages = history?.payload?.messages || history?.payload || [];
+                    if (Array.isArray(messages) && messages.length) {
+                        enrichJobWithHistory(job, messages);
+                    }
+                } catch { /* keep basic info */ }
+            }
+
+            jobs.push(job);
         }
 
         res.json({ jobs });
