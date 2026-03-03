@@ -728,22 +728,42 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
     const gatewayToken = config.gateway?.auth?.token;
     if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
 
+    const container = `openclaw-${instanceId}`;
     try {
-        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'sessions.list', {});
+        const result = await gatewayWsExec(container, gatewayToken, 'sessions.list', {});
         const sessions = result?.payload?.sessions || result?.payload || [];
+        const list = Array.isArray(sessions) ? sessions : [];
 
-        // If specific IDs requested and includeNarrative, fetch previews
         let jobs = [];
-        if (ids && includeNarrative) {
+
+        if (ids) {
+            // Specific session(s) requested -- fetch chat history for detail
             const idList = ids.split(',').map(s => s.trim());
             for (const sessionKey of idList) {
-                try {
-                    const preview = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'sessions.preview', { sessionKey });
-                    jobs.push(mapSessionToJob(preview?.payload || {}, sessionKey));
-                } catch { jobs.push({ id: sessionKey, status: 'unknown' }); }
+                const session = list.find(s => s.key === sessionKey) || {};
+                const job = mapSessionToJob(session, sessionKey);
+
+                if (includeNarrative || includeLog) {
+                    try {
+                        const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey });
+                        const messages = history?.payload?.messages || history?.payload || [];
+                        if (Array.isArray(messages) && messages.length) {
+                            job.narrative = messages.map(m => `**${m.role || 'unknown'}**: ${(m.content || m.text || '').slice(0, 500)}`).join('\n\n');
+                            job.log = messages.map(m => ({
+                                role: m.role,
+                                content: m.content || m.text || '',
+                                ts: m.ts || m.createdAt
+                            }));
+                            // Use first user message as name if available
+                            const firstUser = messages.find(m => m.role === 'user');
+                            if (firstUser) job.name = (firstUser.content || firstUser.text || '').slice(0, 80);
+                        }
+                    } catch { /* keep basic info */ }
+                }
+
+                jobs.push(job);
             }
         } else {
-            const list = Array.isArray(sessions) ? sessions : [];
             jobs = list.slice(0, limit || 100).map(s => mapSessionToJob(s, s.key || s.sessionKey));
         }
 
