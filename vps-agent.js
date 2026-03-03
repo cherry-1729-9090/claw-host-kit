@@ -748,26 +748,42 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
                         const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey });
                         const messages = history?.payload?.messages || history?.payload || [];
                         if (Array.isArray(messages) && messages.length) {
-                            // narrative: array of {ts, role, agentId, text} for frontend rendering
+                            const firstUser = messages.find(m => m.role === 'user');
+                            const lastMsg = messages[messages.length - 1];
+                            const taskMessage = firstUser ? extractContent(firstUser.content) : '';
+
+                            job.name = taskMessage ? `Task: ${taskMessage.slice(0, 60)}` : job.name;
+                            job.payload = { message: taskMessage };
+                            job.metadata.message = taskMessage;
+
+                            if (messages[0]?.timestamp) job.metadata.createdAt = new Date(messages[0].timestamp).toISOString();
+                            if (lastMsg?.timestamp) job.metadata.updatedAt = new Date(lastMsg.timestamp).toISOString();
+
+                            // Last assistant response as lastRun
+                            const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+                            if (lastAssistant) {
+                                const aText = extractContent(lastAssistant.content);
+                                job.metadata.lastRun = {
+                                    status: lastAssistant.stopReason === 'error' ? 'failed' : 'completed',
+                                    ts: lastAssistant.timestamp ? new Date(lastAssistant.timestamp).toISOString() : undefined,
+                                    error: lastAssistant.errorMessage || undefined,
+                                    summary: aText.slice(0, 500) || undefined
+                                };
+                            }
+
+                            // narrative: array of {ts, role, agentId, text}
                             job.metadata.narrative = messages.map(m => ({
-                                ts: m.timestamp || m.ts || '',
+                                ts: m.timestamp ? new Date(m.timestamp).toISOString() : '',
                                 role: m.role || '',
                                 agentId: job.agentId,
                                 text: extractContent(m.content).slice(0, 500)
                             }));
-                            // log: array of plain strings for .join('\n')
+
+                            // log: array of plain strings
                             job.metadata.log = messages.map(m => {
                                 const text = extractContent(m.content);
                                 return `[${m.role || '?'}] ${text}`;
                             });
-                            // message: first user message
-                            const firstUser = messages.find(m => m.role === 'user');
-                            if (firstUser) {
-                                job.metadata.message = extractContent(firstUser.content);
-                                job.name = job.metadata.message.slice(0, 80);
-                            }
-                            if (messages[0]?.timestamp) job.metadata.createdAt = messages[0].timestamp;
-                            if (messages[messages.length - 1]?.timestamp) job.metadata.updatedAt = messages[messages.length - 1].timestamp;
                         }
                     } catch { /* keep basic info */ }
                 }
@@ -796,28 +812,31 @@ function mapSessionToJob(session, key) {
     const sessionKey = key || session.key || '';
     const agentId = sessionKey.split(':')[1] || 'main';
     const name = session.displayName || session.origin?.label || agentId;
-    // Derive status: if aborted → failed, if recently active → picked_up, else assigned
     let status = 'assigned';
     if (session.abortedLastRun) status = 'failed';
     else if (session.updatedAt && (Date.now() - session.updatedAt < 60_000)) status = 'picked_up';
 
+    const createdAt = session.updatedAt ? new Date(session.updatedAt).toISOString() : undefined;
+    const updatedAt = createdAt;
+
     return {
-        id: sessionKey,
+        id: session.sessionId || sessionKey,
         name,
         status,
         agentId,
         model: session.model ? `${session.modelProvider || ''}/${session.model}` : '',
+        payload: { message: '' },
         metadata: {
             status,
             agentId,
-            createdAt: session.updatedAt,
-            updatedAt: session.updatedAt,
+            priority: 3,
+            createdAt,
+            updatedAt,
+            message: '',
             channel: session.lastChannel || session.origin?.provider || 'webchat',
             inputTokens: session.inputTokens || 0,
             outputTokens: session.outputTokens || 0
-        },
-        narrative: session.displayName || `${name} via ${session.lastChannel || 'webchat'}`,
-        log: []
+        }
     };
 }
 
