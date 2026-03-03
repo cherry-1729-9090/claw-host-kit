@@ -748,15 +748,26 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
                         const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey });
                         const messages = history?.payload?.messages || history?.payload || [];
                         if (Array.isArray(messages) && messages.length) {
-                            job.narrative = messages.map(m => `**${m.role || 'unknown'}**: ${(m.content || m.text || '').slice(0, 500)}`).join('\n\n');
-                            job.log = messages.map(m => ({
-                                role: m.role,
-                                content: m.content || m.text || '',
-                                ts: m.ts || m.createdAt
+                            // narrative: array of {ts, role, agentId, text} for frontend rendering
+                            job.metadata.narrative = messages.map(m => ({
+                                ts: m.timestamp || m.ts || '',
+                                role: m.role || '',
+                                agentId: job.agentId,
+                                text: extractContent(m.content).slice(0, 500)
                             }));
-                            // Use first user message as name if available
+                            // log: array of plain strings for .join('\n')
+                            job.metadata.log = messages.map(m => {
+                                const text = extractContent(m.content);
+                                return `[${m.role || '?'}] ${text}`;
+                            });
+                            // message: first user message
                             const firstUser = messages.find(m => m.role === 'user');
-                            if (firstUser) job.name = (firstUser.content || firstUser.text || '').slice(0, 80);
+                            if (firstUser) {
+                                job.metadata.message = extractContent(firstUser.content);
+                                job.name = job.metadata.message.slice(0, 80);
+                            }
+                            if (messages[0]?.timestamp) job.metadata.createdAt = messages[0].timestamp;
+                            if (messages[messages.length - 1]?.timestamp) job.metadata.updatedAt = messages[messages.length - 1].timestamp;
                         }
                     } catch { /* keep basic info */ }
                 }
@@ -773,6 +784,13 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
         res.status(500).json({ error: err.message, jobs: [] });
     }
 });
+
+// OpenClaw content can be: string, array of {type,text}, or empty
+function extractContent(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) return content.map(c => c.text || c.content || '').join('');
+    return '';
+}
 
 function mapSessionToJob(session, key) {
     const sessionKey = key || session.key || '';
