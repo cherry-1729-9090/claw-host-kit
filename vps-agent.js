@@ -667,8 +667,11 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
 
-    // For "main" agent, write to defaults. For others, write to agents.<id>
-    const target = agentId === 'main' ? config.agents.defaults : (config.agents.agents = config.agents.agents || {}, config.agents.agents[agentId] = config.agents.agents[agentId] || {}, config.agents.agents[agentId]);
+    // OpenClaw only supports agents.defaults — no per-agent overrides in config
+    const target = config.agents.defaults;
+
+    // Clean up any previously written invalid key
+    if (config.agents.agents) delete config.agents.agents;
 
     if (updates.model) {
         target.model = target.model || {};
