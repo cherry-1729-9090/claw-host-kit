@@ -462,17 +462,37 @@ function runDockerExec(containerName, args, stdinData) {
 }
 
 app.post('/api/internal/configure-provider', requireInternal, async (req, res) => {
-    const { instanceId, provider, token, expiresIn } = req.body;
+    const { instanceId, provider, token, authMethod, expiresIn, refreshToken } = req.body;
     if (!instanceId || !provider || !token) {
         return res.status(400).json({ error: 'instanceId, provider, and token are required' });
     }
     const containerName = `openclaw-${instanceId}`;
     try {
-        const args = ['models', 'auth', 'paste-token', '--provider', provider];
+        // Determine the appropriate auth command based on authMethod
+        let authCommand;
+        if (authMethod === 'oauth' || authMethod === 'plugin-oauth') {
+            // Use setup-token for OAuth flows (traditional and plugin-based)
+            authCommand = 'setup-token';
+        } else {
+            // Default to paste-token for API keys
+            authCommand = 'paste-token';
+        }
+
+        const args = ['models', 'auth', authCommand, '--provider', provider];
         if (expiresIn) args.push('--expires-in', expiresIn);
-        const output = await runDockerExec(containerName, args, token);
-        console.log(`[vps-agent] configured provider ${provider} for ${instanceId}`);
-        res.json({ success: true, output });
+        
+        // For plugin OAuth, pass the access token
+        const tokenToPass = authMethod === 'plugin-oauth' ? token : token;
+        
+        const output = await runDockerExec(containerName, args, tokenToPass);
+        
+        // Store refresh token if provided (for future token refresh)
+        if (refreshToken && authMethod === 'plugin-oauth') {
+            console.log(`[vps-agent] stored refresh token for ${provider} (${authMethod})`);
+        }
+        
+        console.log(`[vps-agent] configured provider ${provider} for ${instanceId} using ${authCommand} (method: ${authMethod})`);
+        res.json({ success: true, output, authMethod });
     } catch (err) {
         console.error(`[vps-agent] configure-provider failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
