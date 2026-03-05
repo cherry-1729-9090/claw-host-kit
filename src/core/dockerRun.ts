@@ -45,8 +45,8 @@ const DEFAULTS = {
   gatewayPort: 18789,
   ttydPort: 7681,
   cpuLimit: '2',
-  memoryReservation: '4g',
-  memoryLimit: '6g',
+  memoryReservation: '2g',
+  memoryLimit: '4g',
   pidsLimit: 512,
 } as const;
 
