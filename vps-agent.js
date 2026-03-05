@@ -65,18 +65,25 @@ function logProvisionRequest(req, data) {
     console.log(`[vps-agent] ${req.method} ${req.path}:`, data);
 }
 
-// ── Request Logger Middleware (console only for other requests) ──────────────
+// ── Request Logger Middleware (log ALL requests) ────────────────────────────
 app.use((req, res, next) => {
     const start = Date.now();
+    const requestId = Math.random().toString(36).slice(2, 10);
+    
+    // Log incoming request
+    console.log(`[vps-agent] → [${requestId}] ${req.method} ${req.path} from ${req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+    
+    // Log request body for provision/remove requests
+    if ((req.path.includes('/create-instance') || req.path.includes('/remove-instance')) && req.body) {
+        console.log(`[vps-agent] → [${requestId}] Body:`, JSON.stringify(req.body).slice(0, 200));
+    }
+    
     res.on('finish', () => {
         const duration = Date.now() - start;
         const status = res.statusCode;
         const flag = status >= 500 ? '✗' : status >= 400 ? '!' : '✓';
         
-        // Only log provision/remove requests to console, others are silent
-        if (req.path.includes('/create-instance') || req.path.includes('/remove-instance')) {
-            console.log(`[vps-agent] ${flag} ${req.method} ${req.path} → ${status} (${duration}ms)`);
-        }
+        console.log(`[vps-agent] ← [${requestId}] ${flag} ${req.method} ${req.path} → ${status} (${duration}ms)`);
     });
     next();
 });
