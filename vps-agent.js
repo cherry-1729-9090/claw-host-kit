@@ -31,6 +31,56 @@ const HOST_KIT_DIR = process.env.OPENCLAW_HOST_KIT_DIR || __dirname;
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
+// ── Request Logger (to file for container creation requests) ─────────────────
+const LOG_DIR = process.env.VPS_AGENT_LOG_DIR || '/var/log/openclaw';
+const REQUEST_LOG_FILE = path.join(LOG_DIR, 'provision-requests.log');
+
+// Ensure log directory exists
+try {
+    if (!fs.existsSync(LOG_DIR)) {
+        fs.mkdirSync(LOG_DIR, { recursive: true, mode: 0o755 });
+    }
+} catch (err) {
+    console.warn(`[vps-agent] could not create log dir ${LOG_DIR}:`, err.message);
+}
+
+function logProvisionRequest(req, data) {
+    const timestamp = new Date().toISOString();
+    const logEntry = {
+        timestamp,
+        method: req.method,
+        path: req.path,
+        ip: req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+        ...data
+    };
+    
+    const logLine = JSON.stringify(logEntry) + '\n';
+    
+    try {
+        fs.appendFileSync(REQUEST_LOG_FILE, logLine, { encoding: 'utf8', mode: 0o644 });
+    } catch (err) {
+        console.error(`[vps-agent] failed to write provision log:`, err.message);
+    }
+    
+    console.log(`[vps-agent] ${req.method} ${req.path}:`, data);
+}
+
+// ── Request Logger Middleware (console only for other requests) ──────────────
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        const status = res.statusCode;
+        const flag = status >= 500 ? '✗' : status >= 400 ? '!' : '✓';
+        
+        // Only log provision/remove requests to console, others are silent
+        if (req.path.includes('/create-instance') || req.path.includes('/remove-instance')) {
+            console.log(`[vps-agent] ${flag} ${req.method} ${req.path} → ${status} (${duration}ms)`);
+        }
+    });
+    next();
+});
+
 function requireInternal(req, res, next) {
     if (!INTERNAL_SECRET || req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -187,7 +237,17 @@ app.get('/api/internal/containers/:instanceId', requireInternal, async (req, res
 
 app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
     const { instanceId } = req.body;
-    if (!validId(instanceId)) return res.status(400).json({ error: 'Invalid instanceId' });
+    
+    logProvisionRequest(req, { 
+        action: 'create-instance-start', 
+        instanceId,
+        requestBody: req.body 
+    });
+    
+    if (!validId(instanceId)) {
+        logProvisionRequest(req, { action: 'create-instance-invalid-id', instanceId });
+        return res.status(400).json({ error: 'Invalid instanceId' });
+    }
 
     console.log(`[vps-agent] create-instance request for instanceId=${instanceId}`);
 
@@ -275,9 +335,25 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
         };
+        
+        logProvisionRequest(req, { 
+            action: 'create-instance-success', 
+            instanceId,
+            containerName: result.containerName,
+            hasToken: !!gatewayToken,
+            ramLimitMB: CONTAINER_RAM_LIMIT_MB
+        });
+        
         console.log(`[vps-agent] create-instance done for ${instanceId}:`, JSON.stringify({ ...result, output: '[truncated]' }));
         return res.json(result);
     } catch (err) {
+        logProvisionRequest(req, { 
+            action: 'create-instance-error', 
+            instanceId: req.body.instanceId,
+            error: err.message,
+            stack: err.stack?.slice(0, 500)
+        });
+        
         console.error('[vps-agent] create-instance error:', err.message);
         return res.status(500).json({ error: err.message });
     }
@@ -287,13 +363,22 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
 
 app.delete('/api/internal/remove-instance/:instanceId', requireInternal, async (req, res) => {
     const { instanceId } = req.params;
-    if (!validId(instanceId)) return res.status(400).json({ error: 'Invalid instanceId' });
+    
+    logProvisionRequest(req, { action: 'remove-instance-start', instanceId });
+    
+    if (!validId(instanceId)) {
+        logProvisionRequest(req, { action: 'remove-instance-invalid-id', instanceId });
+        return res.status(400).json({ error: 'Invalid instanceId' });
+    }
 
     try {
         await run('docker', ['rm', '-f', `openclaw-${instanceId}`]);
         execFile('rm', ['-rf', `/var/lib/openclaw/instances/${instanceId}`]);
+        
+        logProvisionRequest(req, { action: 'remove-instance-success', instanceId });
         return res.json({ ok: true, instanceId });
     } catch (err) {
+        logProvisionRequest(req, { action: 'remove-instance-error', instanceId, error: err.message });
         console.error('[vps-agent] remove-instance:', err);
         return res.status(500).json({ error: err.message });
     }
