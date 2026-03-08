@@ -553,6 +553,20 @@ function runDockerExec(containerName, args, stdinData) {
     });
 }
 
+// Helper for running direct commands (not through OpenClaw CLI)
+function runDockerExecDirect(containerName, args) {
+    return new Promise((resolve, reject) => {
+        const proc = execFile('docker', ['exec', containerName, ...args]);
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        proc.on('close', code => {
+            if (code !== 0) reject(new Error((stderr || stdout).trim().slice(0, 500)));
+            else resolve((stdout || stderr).trim());
+        });
+    });
+}
+
 app.post('/api/internal/configure-provider', requireInternal, async (req, res) => {
     const { instanceId, provider, token, authMethod, expiresIn, refreshToken } = req.body;
     if (!instanceId || !provider || !token) {
@@ -597,7 +611,7 @@ fs.writeFileSync(authProfilesPath, JSON.stringify(store, null, 2));
 console.log('auth-profile-updated');
 `;
         
-        await runDockerExec(containerName, ['node', '-e', authProfileScript]);
+        await runDockerExecDirect(containerName, ['node', '-e', authProfileScript]);
         
         // Step 2: Update openclaw.json to reference this auth profile
         const configUpdateScript = `
@@ -630,7 +644,7 @@ fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('config-updated');
 `;
         
-        await runDockerExec(containerName, ['node', '-e', configUpdateScript]);
+        await runDockerExecDirect(containerName, ['node', '-e', configUpdateScript]);
         
         // Step 3: Use gateway WebSocket to reload config
         const gatewayToken = await getGatewayToken(containerName);
