@@ -567,6 +567,22 @@ function runDockerExecDirect(containerName, args) {
     });
 }
 
+// Get gateway token from container
+async function getGatewayToken(containerName) {
+    const script = `
+const fs = require('fs');
+const path = require('path');
+const tokenPath = path.join(process.env.HOME, '.openclaw', 'gateway-token');
+try {
+    console.log(fs.readFileSync(tokenPath, 'utf8').trim());
+} catch (err) {
+    console.error('Token not found');
+    process.exit(1);
+}
+`;
+    return await runDockerExecDirect(containerName, ['node', '-e', script]);
+}
+
 app.post('/api/internal/configure-provider', requireInternal, async (req, res) => {
     const { instanceId, provider, token, authMethod, expiresIn, refreshToken } = req.body;
     if (!instanceId || !provider || !token) {
