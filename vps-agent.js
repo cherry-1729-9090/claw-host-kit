@@ -662,12 +662,12 @@ console.log('config-updated');
         
         await runDockerExecDirect(containerName, ['node', '-e', configUpdateScript]);
         
-        // Step 3: Use gateway WebSocket to reload config
-        const gatewayToken = await getGatewayToken(containerName);
+        // Step 3: Use gateway WebSocket to reload config (optional - gateway may not be running)
         try {
+            const gatewayToken = await getGatewayToken(containerName);
             await gatewayWsExec(containerName, gatewayToken, 'config.apply', {});
         } catch (err) {
-            console.warn(`[vps-agent] config.apply failed (gateway may not be running): ${err.message}`);
+            console.warn(`[vps-agent] config.apply skipped (gateway token not found or not running): ${err.message}`);
         }
         
         // Store refresh token if provided (for future token refresh)
