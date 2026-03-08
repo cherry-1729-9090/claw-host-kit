@@ -560,31 +560,29 @@ app.post('/api/internal/configure-provider', requireInternal, async (req, res) =
     }
     const containerName = `openclaw-${instanceId}`;
     try {
-        // Determine the appropriate auth command based on authMethod
-        let authCommand;
-        if (authMethod === 'oauth' || authMethod === 'plugin-oauth') {
-            // Use setup-token for OAuth flows (traditional and plugin-based)
-            authCommand = 'setup-token';
-        } else {
-            // Default to paste-token for API keys
-            authCommand = 'paste-token';
-        }
-
-        const args = ['models', 'auth', authCommand, '--provider', provider];
-        if (expiresIn) args.push('--expires-in', expiresIn);
+        // OpenClaw's built-in providers (like Anthropic, OpenAI, etc.) automatically read API
+        // keys from environment variables (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY).
+        // This is the simplest and most reliable way to configure providers programmatically.
+        // OpenClaw handles baseUrl, API type, and model discovery internally for these providers.
         
-        // For plugin OAuth, pass the access token
-        const tokenToPass = authMethod === 'plugin-oauth' ? token : token;
+        // Set the environment variable for the provider
+        const envVar = `${provider.toUpperCase()}_API_KEY`;
+        const args = ['sh', '-c', `echo 'export ${envVar}="${token}"' >> ~/.bashrc && export ${envVar}="${token}"`];
         
-        const output = await runDockerExec(containerName, args, tokenToPass);
+        await runDockerExec(containerName, args);
+        
+        // Restart the OpenClaw gateway to pick up the new environment variable
+        // Note: This is a simple approach; in production you might want to use
+        // the gateway's config reload mechanism instead
+        await runDockerExec(containerName, ['sh', '-c', 'pkill -HUP openclaw || true']);
         
         // Store refresh token if provided (for future token refresh)
         if (refreshToken && authMethod === 'plugin-oauth') {
             console.log(`[vps-agent] stored refresh token for ${provider} (${authMethod})`);
         }
         
-        console.log(`[vps-agent] configured provider ${provider} for ${instanceId} using ${authCommand} (method: ${authMethod})`);
-        res.json({ success: true, output, authMethod });
+        console.log(`[vps-agent] configured provider ${provider} for ${instanceId} via ${envVar} (method: ${authMethod})`);
+        res.json({ success: true, output: `Set ${envVar}`, authMethod });
     } catch (err) {
         console.error(`[vps-agent] configure-provider failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
