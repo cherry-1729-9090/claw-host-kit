@@ -560,29 +560,93 @@ app.post('/api/internal/configure-provider', requireInternal, async (req, res) =
     }
     const containerName = `openclaw-${instanceId}`;
     try {
-        // OpenClaw's built-in providers (like Anthropic, OpenAI, etc.) automatically read API
-        // keys from environment variables (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY).
-        // This is the simplest and most reliable way to configure providers programmatically.
-        // OpenClaw handles baseUrl, API type, and model discovery internally for these providers.
+        // OpenClaw uses auth-profiles.json to store credentials and references them in openclaw.json.
+        // We'll directly manipulate these files to configure the provider, mimicking what the
+        // OpenClaw CLI does internally when you run `openclaw models auth paste-token`.
         
-        // Set the environment variable for the provider
-        const envVar = `${provider.toUpperCase()}_API_KEY`;
-        const args = ['sh', '-c', `echo 'export ${envVar}="${token}"' >> ~/.bashrc && export ${envVar}="${token}"`];
+        const profileId = `${provider}:default`;
         
-        await runDockerExec(containerName, args);
+        // Step 1: Create/update auth-profiles.json with the credential
+        const authProfileScript = `
+const fs = require('fs');
+const path = require('path');
+const configDir = path.join(process.env.HOME, '.openclaw');
+const authProfilesPath = path.join(configDir, 'auth-profiles.json');
+
+// Read or create auth-profiles.json
+let store = { version: 1, profiles: {} };
+try {
+    const content = fs.readFileSync(authProfilesPath, 'utf8');
+    store = JSON.parse(content);
+} catch (err) {
+    // File doesn't exist or is invalid, start fresh
+}
+
+// Add/update the profile
+store.profiles['${profileId}'] = {
+    type: 'token',
+    provider: '${provider}',
+    token: '${token.replace(/'/g, "\\'")}',
+    ${expiresIn ? `expires: ${Date.now() + parseInt(expiresIn)},` : ''}
+    createdAt: ${Date.now()},
+    updatedAt: ${Date.now()}
+};
+
+// Write back
+fs.writeFileSync(authProfilesPath, JSON.stringify(store, null, 2));
+console.log('auth-profile-updated');
+`;
         
-        // Restart the OpenClaw gateway to pick up the new environment variable
-        // Note: This is a simple approach; in production you might want to use
-        // the gateway's config reload mechanism instead
-        await runDockerExec(containerName, ['sh', '-c', 'pkill -HUP openclaw || true']);
+        await runDockerExec(containerName, ['node', '-e', authProfileScript]);
+        
+        // Step 2: Update openclaw.json to reference this auth profile
+        const configUpdateScript = `
+const fs = require('fs');
+const path = require('path');
+const configPath = path.join(process.env.HOME, '.openclaw', 'openclaw.json');
+
+// Read openclaw.json
+let config = {};
+try {
+    const content = fs.readFileSync(configPath, 'utf8');
+    config = JSON.parse(content);
+} catch (err) {
+    console.error('Failed to read config:', err.message);
+    process.exit(1);
+}
+
+// Ensure auth structure exists
+if (!config.auth) config.auth = {};
+if (!config.auth.profiles) config.auth.profiles = {};
+
+// Add profile reference
+config.auth.profiles['${profileId}'] = {
+    provider: '${provider}',
+    mode: 'api_key'
+};
+
+// Write back
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+console.log('config-updated');
+`;
+        
+        await runDockerExec(containerName, ['node', '-e', configUpdateScript]);
+        
+        // Step 3: Use gateway WebSocket to reload config
+        const gatewayToken = await getGatewayToken(containerName);
+        try {
+            await gatewayWsExec(containerName, gatewayToken, 'config.apply', {});
+        } catch (err) {
+            console.warn(`[vps-agent] config.apply failed (gateway may not be running): ${err.message}`);
+        }
         
         // Store refresh token if provided (for future token refresh)
         if (refreshToken && authMethod === 'plugin-oauth') {
             console.log(`[vps-agent] stored refresh token for ${provider} (${authMethod})`);
         }
         
-        console.log(`[vps-agent] configured provider ${provider} for ${instanceId} via ${envVar} (method: ${authMethod})`);
-        res.json({ success: true, output: `Set ${envVar}`, authMethod });
+        console.log(`[vps-agent] configured provider ${provider} for ${instanceId} via auth-profiles.json (method: ${authMethod})`);
+        res.json({ success: true, output: 'Provider configured', authMethod, profileId });
     } catch (err) {
         console.error(`[vps-agent] configure-provider failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
