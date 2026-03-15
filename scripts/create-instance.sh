@@ -24,6 +24,7 @@ fi
 
 OPENCLAW_SUBDOMAIN="${OPENCLAW_SUBDOMAIN:-openclaw}"
 OPENCLAW_RUNTIME_IMAGE="${OPENCLAW_RUNTIME_IMAGE:-openclaw-ttyd:local}"
+OPENCLAW_MEM0_API_KEY="${OPENCLAW_MEM0_API_KEY:-${MEM0_API_KEY:-}}"
 
 WILDCARD_DOMAIN="${OPENCLAW_HOST_SHARD}.${OPENCLAW_SUBDOMAIN}.${OPENCLAW_BASE_DOMAIN}"
 DNS_INSTANCE_ID=$(echo "${INSTANCE_ID}" | tr '_' '-' | tr '[:upper:]' '[:lower:]')
@@ -38,6 +39,11 @@ CPU_LIMIT="${OPENCLAW_CPU_LIMIT:-2}"
 MEMORY_LIMIT="${OPENCLAW_CONTAINER_MEMORY:-${OPENCLAW_MEMORY_LIMIT:-5120m}}"
 MEMORY_RESERVATION="${OPENCLAW_MEMORY_RESERVATION:-4096m}"
 PIDS_LIMIT="${OPENCLAW_PIDS_LIMIT:-512}"
+
+DOCKER_ENV_ARGS=()
+if [ -n "${OPENCLAW_MEM0_API_KEY}" ]; then
+  DOCKER_ENV_ARGS+=(-e "MEM0_API_KEY=${OPENCLAW_MEM0_API_KEY}")
+fi
 
 
 mkdir -p "${DATA_DIR}"
@@ -67,6 +73,7 @@ docker run -d \
   --memory="${MEMORY_LIMIT}" \
   --memory-swap="${MEMORY_LIMIT}" \
   --pids-limit="${PIDS_LIMIT}" \
+  "${DOCKER_ENV_ARGS[@]}" \
   -v "${DATA_DIR}:/home/node/.openclaw" \
   --label 'traefik.enable=true' \
   --label "traefik.docker.network=${NETWORK}" \

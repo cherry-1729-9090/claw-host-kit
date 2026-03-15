@@ -28,6 +28,10 @@ app.use(express.json());
 const PORT = process.env.VPS_AGENT_PORT || 4444;
 const INTERNAL_SECRET = process.env.OPENCLAW_INTERNAL_SECRET || '';
 const HOST_KIT_DIR = process.env.OPENCLAW_HOST_KIT_DIR || __dirname;
+const MEM0_PLUGIN_PACKAGE = '@mem0/openclaw-mem0';
+const MEM0_PLUGIN_KEY = 'openclaw-mem0';
+const MEM0_ENV_PLACEHOLDER = '${MEM0_API_KEY}';
+const MEM0_API_KEY = process.env.OPENCLAW_MEM0_API_KEY || process.env.MEM0_API_KEY || '';
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -97,6 +101,14 @@ function requireInternal(req, res, next) {
 
 function validId(id) {
     return typeof id === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(id);
+}
+
+function listInstanceIds() {
+    if (!fs.existsSync(INSTANCES_DIR)) return [];
+    return fs.readdirSync(INSTANCES_DIR, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && validId(entry.name))
+        .map((entry) => entry.name)
+        .sort();
 }
 
 function run(cmd, args = [], opts = {}) {
@@ -334,11 +346,14 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             console.warn(`[vps-agent] gateway token NOT found after ${TOKEN_POLL_TIMEOUT_MS / 1000}s for ${instanceId} — container may still be starting`);
         }
 
+        const mem0 = await ensureMem0ForInstance(instanceId);
+
         const result = {
             ok: true,
             instanceId,
             containerName: `openclaw-${instanceId}`,
             gatewayToken,
+            mem0,
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
         };
@@ -364,6 +379,34 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
         console.error('[vps-agent] create-instance error:', err.message);
         return res.status(500).json({ error: err.message });
     }
+});
+
+app.post('/api/internal/mem0-sync', requireInternal, async (req, res) => {
+    const requestedId = typeof req.body?.instanceId === 'string' ? req.body.instanceId.trim() : '';
+    if (requestedId && !validId(requestedId)) {
+        return res.status(400).json({ error: 'Invalid instanceId' });
+    }
+
+    const targetIds = requestedId ? [requestedId] : listInstanceIds();
+    const results = [];
+
+    for (const instanceId of targetIds) {
+        try {
+            const result = await ensureMem0ForInstance(instanceId);
+            results.push({ instanceId, ...result });
+        } catch (err) {
+            results.push({ instanceId, ok: false, error: err.message });
+        }
+    }
+
+    const failed = results.filter((result) => !result.ok);
+    const statusCode = failed.length ? 207 : 200;
+    return res.status(statusCode).json({
+        ok: failed.length === 0,
+        total: results.length,
+        failed: failed.length,
+        results,
+    });
 });
 
 // ── Remove instance ───────────────────────────────────────────────────────────
@@ -434,6 +477,30 @@ function readInstanceConfig(instanceId) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     if (!fs.existsSync(configPath)) return null;
     try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
+}
+
+function ensureMem0PluginConfig(config, instanceId) {
+    config.plugins = config.plugins || {};
+    config.plugins.entries = config.plugins.entries || {};
+    config.plugins.slots = config.plugins.slots || {};
+
+    const previous = config.plugins.entries[MEM0_PLUGIN_KEY];
+    const next = {
+        ...(previous && typeof previous === 'object' ? previous : {}),
+        enabled: true,
+        config: {
+            ...(previous?.config && typeof previous.config === 'object' ? previous.config : {}),
+            apiKey: MEM0_ENV_PLACEHOLDER,
+            userId: instanceId,
+        },
+    };
+
+    const previousSlot = config.plugins.slots.memory;
+    const changed = JSON.stringify(previous || null) !== JSON.stringify(next)
+        || previousSlot !== MEM0_PLUGIN_KEY;
+    config.plugins.entries[MEM0_PLUGIN_KEY] = next;
+    config.plugins.slots.memory = MEM0_PLUGIN_KEY;
+    return changed;
 }
 
 const wsDir = (instanceId) => path.join(INSTANCES_DIR, instanceId, 'workspace');
@@ -557,6 +624,19 @@ function runDockerExec(containerName, args, stdinData) {
 function runDockerExecDirect(containerName, args) {
     return new Promise((resolve, reject) => {
         const proc = execFile('docker', ['exec', containerName, ...args]);
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        proc.on('close', code => {
+            if (code !== 0) reject(new Error((stderr || stdout).trim().slice(0, 500)));
+            else resolve((stdout || stderr).trim());
+        });
+    });
+}
+
+function runDockerExecAsRoot(containerName, args) {
+    return new Promise((resolve, reject) => {
+        const proc = execFile('docker', ['exec', '-u', '0', containerName, ...args]);
         let stdout = '', stderr = '';
         proc.stdout.on('data', d => stdout += d);
         proc.stderr.on('data', d => stderr += d);
@@ -1156,6 +1236,81 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
 function writeInstanceConfig(instanceId, config) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+}
+
+function isMem0PluginInstalled(instanceId) {
+    const extensionDir = path.join(INSTANCES_DIR, instanceId, 'extensions', MEM0_PLUGIN_KEY);
+    return fs.existsSync(extensionDir);
+}
+
+async function restartGateway(containerName) {
+    await runDockerExec(containerName, ['gateway', 'restart']);
+}
+
+async function ensurePython3InContainer(containerName) {
+    try {
+        await runDockerExecDirect(containerName, ['python3', '--version']);
+        return false;
+    } catch {
+        console.log(`[vps-agent] installing python3 in ${containerName}`);
+        await runDockerExecAsRoot(containerName, ['sh', '-lc', 'apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*']);
+        return true;
+    }
+}
+
+async function ensureMem0ForInstance(instanceId) {
+    if (!validId(instanceId)) {
+        throw new Error('Invalid instanceId');
+    }
+    if (!MEM0_API_KEY) {
+        throw new Error('OPENCLAW_MEM0_API_KEY is not configured on the host');
+    }
+
+    const containerName = `openclaw-${instanceId}`;
+    const config = readInstanceConfig(instanceId);
+    if (!config) {
+        throw new Error('Config not found');
+    }
+
+    const pythonInstalledNow = await ensurePython3InContainer(containerName);
+
+    const alreadyInstalled = isMem0PluginInstalled(instanceId);
+    let installedNow = false;
+    if (!alreadyInstalled) {
+        const currentSlot = config.plugins?.slots?.memory;
+        if (currentSlot === MEM0_PLUGIN_KEY) {
+            delete config.plugins.slots.memory;
+            if (config.plugins.slots && Object.keys(config.plugins.slots).length === 0) {
+                delete config.plugins.slots;
+            }
+            writeInstanceConfig(instanceId, config);
+            console.log(`[vps-agent] cleared Mem0 memory slot before install for ${instanceId}`);
+        }
+        console.log(`[vps-agent] installing ${MEM0_PLUGIN_PACKAGE} in ${containerName}`);
+        await runDockerExec(containerName, ['plugins', 'install', MEM0_PLUGIN_PACKAGE]);
+        installedNow = true;
+    }
+
+    const configChanged = ensureMem0PluginConfig(config, instanceId);
+    if (configChanged) {
+        writeInstanceConfig(instanceId, config);
+        console.log(`[vps-agent] wrote Mem0 config for ${instanceId}`);
+    }
+
+    if (pythonInstalledNow || installedNow || configChanged) {
+        await restartGateway(containerName);
+    }
+
+    return {
+        ok: true,
+        installed: true,
+        pythonInstalled: true,
+        pythonInstalledNow,
+        installedNow,
+        configChanged,
+        plugin: MEM0_PLUGIN_KEY,
+        userId: instanceId,
+    };
 }
 
 app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
