@@ -709,6 +709,23 @@ const RESERVED_PROVIDER_KEYS = new Set([
     'openai-codex', 'opencode',
 ]);
 
+function normalizeCustomProviderApi(api) {
+    const value = String(api || 'openai').trim().toLowerCase();
+    if (value === 'anthropic' || value === 'anthropic-messages') return 'anthropic-messages';
+    if (value === 'google' || value === 'google-generative-ai') return 'google-generative-ai';
+    if (value === 'openai' || value === 'openai-completions') return 'openai-completions';
+    if (value === 'openai-responses') return 'openai-responses';
+    return value;
+}
+
+function normalizeCustomProviderModelId(providerKey, rawId) {
+    const trimmed = String(rawId || '').trim();
+    if (!trimmed) return '';
+    const firstSlash = trimmed.indexOf('/');
+    const suffix = firstSlash >= 0 ? trimmed.slice(firstSlash + 1) : trimmed;
+    return `${providerKey}/${suffix}`;
+}
+
 // ── Custom provider config ────────────────────────────────────────────────────
 app.post('/api/internal/configure-custom-provider', requireInternal, async (req, res) => {
     const { instanceId, key, label, baseUrl, api, apiKey, authHeader, headers, models } = req.body;
@@ -729,35 +746,52 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
         if (!config) return res.status(404).json({ error: 'Config not found' });
 
         config.models = config.models || {};
+        config.models.mode = config.models.mode || 'merge';
         config.models.providers = config.models.providers || {};
 
-        const provider = { baseUrl };
+        const provider = {
+            baseUrl: String(baseUrl).trim(),
+            api: normalizeCustomProviderApi(api),
+        };
         if (apiKey) provider.apiKey = apiKey;
-        if (api) provider.api = api === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
         if (headers && typeof headers === 'object') provider.headers = headers;
+        if (typeof label === 'string' && label.trim()) provider.label = label.trim();
+        if (authHeader === true || String(authHeader || '').trim().toLowerCase() === 'authorization') {
+            provider.authHeader = true;
+        }
         if (Array.isArray(models) && models.length) {
-            provider.models = models.map(m => ({
-                id: m.id || m,
-                name: m.name || m.id || String(m)
-            }));
+            provider.models = models
+                .map((m) => {
+                    const sourceId = typeof m === 'string' ? m : m?.id;
+                    const normalizedId = normalizeCustomProviderModelId(key, sourceId);
+                    if (!normalizedId) return null;
+
+                    const fallbackName = normalizedId.slice(normalizedId.indexOf('/') + 1);
+                    return {
+                        id: normalizedId,
+                        name: (typeof m === 'object' && typeof m?.name === 'string' && m.name.trim())
+                            ? m.name.trim()
+                            : fallbackName
+                    };
+                })
+                .filter(Boolean);
         }
 
         config.models.providers[key] = provider;
 
-        // Write auth-profiles.json so the gateway can find the API key
-        if (apiKey) {
-            const authDir = path.join(INSTANCES_DIR, instanceId, 'agents', 'main', 'agent');
-            fs.mkdirSync(authDir, { recursive: true });
-            const authPath = path.join(authDir, 'auth-profiles.json');
-            let authProfiles = {};
-            try { authProfiles = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch {}
-            authProfiles[key] = { apiKey };
-            fs.writeFileSync(authPath, JSON.stringify(authProfiles), 'utf8');
+        writeInstanceConfig(instanceId, config);
+
+        try {
+            const gatewayToken = config.gateway?.auth?.token || await getGatewayToken(`openclaw-${instanceId}`);
+            if (gatewayToken) {
+                await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'config.apply', {});
+            }
+        } catch (err) {
+            console.warn(`[vps-agent] custom provider config.apply skipped for ${instanceId}: ${err.message}`);
         }
 
-        writeInstanceConfig(instanceId, config);
         console.log(`[vps-agent] custom provider ${key} configured for ${instanceId}`);
-        res.json({ success: true, providerKey: key });
+        res.json({ success: true, providerKey: key, provider });
     } catch (err) {
         console.error(`[vps-agent] configure-custom-provider failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
@@ -881,6 +915,14 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
         target.model = target.model || {};
         if (updates.model.primary !== undefined) target.model.primary = updates.model.primary;
         if (updates.model.fallbacks !== undefined) target.model.fallbacks = updates.model.fallbacks;
+
+        if (agentId === 'main') {
+            config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+            const mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
+            if (mainAgent && updates.model.primary !== undefined) {
+                mainAgent.model = updates.model.primary;
+            }
+        }
     }
     if (updates.identity) {
         target.identity = target.identity || {};
