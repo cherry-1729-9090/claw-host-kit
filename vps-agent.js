@@ -2791,6 +2791,150 @@ app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
     });
 });
 
+async function executeDirectAgentRun(instanceId, taskRecord) {
+    const containerName = `openclaw-${instanceId}`;
+    const startedAt = new Date().toISOString();
+
+    upsertTaskRecord(instanceId, {
+        ...taskRecord,
+        status: 'in_progress',
+        updatedAt: startedAt,
+        log: [
+            ...(taskRecord.log || []),
+            { ts: startedAt, role: 'system', text: `Direct conversation started with ${taskRecord.agentId}` }
+        ]
+    });
+
+    try {
+        const output = await runDockerExec(containerName, [
+            'agent',
+            '--agent', taskRecord.agentId,
+            '--session-id', taskRecord.id,
+            '--message', taskRecord.message,
+            '--json'
+        ]);
+        const parsed = extractJsonObject(output);
+        const responseText = parsed?.payloads?.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
+            || parsed?.meta?.lastDecision?.reason
+            || output;
+        const finishedAt = new Date().toISOString();
+        const modelProvider = parsed?.meta?.agentMeta?.provider || '';
+        const modelName = parsed?.meta?.agentMeta?.model || '';
+        const resolvedModel = modelProvider && modelName ? `${modelProvider}/${modelName}` : (taskRecord.model || '');
+
+        upsertTaskRecord(instanceId, {
+            ...taskRecord,
+            status: 'completed',
+            updatedAt: finishedAt,
+            model: resolvedModel,
+            narrative: mergeNarrativeEntries(
+                Array.isArray(taskRecord.narrative) ? taskRecord.narrative : [],
+                [{
+                    ts: finishedAt,
+                    agentId: taskRecord.agentId,
+                    role: 'assistant',
+                    text: String(responseText || '').trim() || 'No response returned.'
+                }]
+            ),
+            lastDecision: {
+                ts: finishedAt,
+                reason: String(responseText || '').trim() || 'Conversation completed.'
+            },
+            lastRun: {
+                ts: finishedAt,
+                summary: String(responseText || '').trim() || 'Conversation completed.',
+                output,
+                error: null
+            },
+            log: [
+                ...(taskRecord.log || []),
+                { ts: startedAt, role: 'system', text: `Direct conversation started with ${taskRecord.agentId}` },
+                { ts: finishedAt, role: 'assistant', text: String(responseText || '').trim() || 'Conversation completed.' }
+            ]
+        });
+    } catch (err) {
+        const finishedAt = new Date().toISOString();
+        upsertTaskRecord(instanceId, {
+            ...taskRecord,
+            status: 'failed',
+            updatedAt: finishedAt,
+            lastRun: {
+                ts: finishedAt,
+                summary: '',
+                error: err.message
+            },
+            log: [
+                ...(taskRecord.log || []),
+                { ts: startedAt, role: 'system', text: `Direct conversation started with ${taskRecord.agentId}` },
+                { ts: finishedAt, role: 'system', text: `Conversation failed: ${err.message}` }
+            ]
+        });
+    }
+}
+
+app.post('/api/internal/broadcast-create', requireInternal, async (req, res) => {
+    const { instanceId, message, agentIds } = req.body || {};
+    if (!instanceId || !message) {
+        return res.status(400).json({ error: 'instanceId and message are required' });
+    }
+
+    const config = readInstanceConfig(instanceId);
+    const defaultsModel = config?.agents?.defaults?.model || {};
+    const requestedAgentIds = Array.isArray(agentIds) && agentIds.length
+        ? agentIds.map((value) => String(value || '').trim()).filter(Boolean)
+        : [MANAGER_AGENT_ID];
+    const uniqueAgentIds = Array.from(new Set(requestedAgentIds));
+
+    const tasks = [];
+    for (const agentId of uniqueAgentIds) {
+        const configuredAgent = Array.isArray(config?.agents?.list)
+            ? config.agents.list.find((agent) => agent?.id === agentId)
+            : null;
+        const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaultsModel).primary;
+        const taskId = `bcast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const now = new Date().toISOString();
+        const taskRecord = {
+            id: taskId,
+            name: `Broadcast: ${String(message).slice(0, 60)}`,
+            message: String(message).trim(),
+            agentId,
+            assignedAgentId: agentId,
+            managerAgentId: '',
+            requestedAgentId: agentId,
+            priority: 3,
+            status: 'assigned',
+            createdAt: now,
+            updatedAt: now,
+            model: resolvedModel,
+            narrative: [],
+            log: [
+                { ts: now, role: 'system', text: `Broadcast message queued for ${agentId}` }
+            ],
+            lastRun: null,
+            lastDecision: null,
+            requiredCapabilities: [],
+            requiredApps: [],
+            manager: null
+        };
+
+        upsertTaskRecord(instanceId, taskRecord);
+        tasks.push({
+            id: taskId,
+            agentId,
+            name: taskRecord.name,
+            status: taskRecord.status
+        });
+
+        queueMicrotask(() => {
+            executeDirectAgentRun(instanceId, taskRecord).catch((err) => {
+                console.error(`[vps-agent] broadcast direct run failed for ${instanceId}/${taskId}:`, err.message);
+            });
+        });
+    }
+
+    return res.json({ ok: true, tasks });
+});
+
 app.post('/api/internal/tasks-list', requireInternal, async (req, res) => {
     const { instanceId, ids, limit, includeNarrative, includeLog } = req.body || {};
     if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
