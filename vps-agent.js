@@ -1025,7 +1025,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
         const managerNarrative = {
             ts: routedAt,
             agentId: MANAGER_AGENT_ID,
-            role: 'assistant',
+            role: managerDecision.decision === 'assign' ? 'agent_message' : 'assistant',
             text: managerDecision.decision === 'assign'
                 ? `Assigned to ${managerDecision.agentId}. ${managerDecision.reason}`
                 : managerDecision.reason || 'Task could not be assigned.',
@@ -1143,6 +1143,14 @@ async function executeTaskRecord(instanceId, taskRecord) {
         const finalSummary = outcome.summary || 'Task run completed without a structured summary.';
         const narrative = [
             managerNarrative,
+            {
+                ts: finishedAt,
+                agentId: assignee?.id || managerDecision.agentId,
+                role: assignee?.id && assignee.id !== MANAGER_AGENT_ID ? 'agent_message' : 'assistant',
+                text: assignee?.id && assignee.id !== MANAGER_AGENT_ID
+                    ? `Reported back to Mission Manager: ${finalSummary}`
+                    : finalSummary
+            },
             {
                 ts: finishedAt,
                 agentId: assignee?.id || managerDecision.agentId,
@@ -2430,6 +2438,167 @@ function enrichJobWithHistory(job, messages, options = {}) {
     return job;
 }
 
+function dedupeNarrativeEntries(entries) {
+    const seen = new Set();
+    return entries.filter((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        const key = JSON.stringify([
+            entry.ts || '',
+            entry.agentId || '',
+            entry.role || '',
+            entry.text || ''
+        ]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+function mergeNarrativeEntries(...groups) {
+    return dedupeNarrativeEntries(groups.flat().filter(Boolean))
+        .sort((left, right) => String(left?.ts || '').localeCompare(String(right?.ts || '')));
+}
+
+function summarizeTaskHistoryMessage({ message, fallbackAgentId }) {
+    const role = String(message?.role || '').toLowerCase();
+    const timestamp = message?.timestamp || null;
+    const provenanceKind = message?.provenance?.kind || null;
+    const fromAgentId = message?.provenance?.fromAgentId || message?.provenance?.from || fallbackAgentId || 'main';
+    const text = extractNarrativeText(message?.content || '');
+    if (!text) return null;
+
+    if (role === 'user' && provenanceKind === 'inter_session') {
+        return {
+            ts: timestamp,
+            agentId: fromAgentId,
+            role: 'agent_message',
+            text,
+            provenanceKind
+        };
+    }
+
+    if (role !== 'assistant') return null;
+
+    if (String(fallbackAgentId || '') === MANAGER_AGENT_ID) {
+        const decision = parseManagerDecision(text);
+        if (decision) {
+            return {
+                ts: timestamp,
+                agentId: MANAGER_AGENT_ID,
+                role: decision.decision === 'assign' ? 'agent_message' : 'assistant',
+                text: decision.decision === 'assign'
+                    ? `Assigned to ${decision.agentId}. ${decision.reason}`
+                    : decision.reason || 'Task triage update.',
+            };
+        }
+    }
+
+    const outcome = parseTaskOutcome(text);
+    if (outcome?.summary) {
+        return {
+            ts: timestamp,
+            agentId: fallbackAgentId || 'main',
+            role: fallbackAgentId && fallbackAgentId !== MANAGER_AGENT_ID ? 'agent_message' : 'assistant',
+            text: outcome.summary
+        };
+    }
+
+    return {
+        ts: timestamp,
+        agentId: fallbackAgentId || 'main',
+        role: fallbackAgentId && fallbackAgentId !== MANAGER_AGENT_ID ? 'agent_message' : 'assistant',
+        text
+    };
+}
+
+async function enrichStoredTaskWithGatewayHistory(instanceId, task, options = {}) {
+    const { includeLog = false } = options;
+    const config = readInstanceConfig(instanceId);
+    const gatewayToken = config?.gateway?.auth?.token;
+    if (!gatewayToken) return task;
+
+    const container = `openclaw-${instanceId}`;
+    const narrative = Array.isArray(task?.narrative) ? [...task.narrative] : [];
+    const log = Array.isArray(task?.log) ? [...task.log] : [];
+    const sessionTargets = [
+        { sessionKey: `agent:${MANAGER_AGENT_ID}:${task.id}-manager`, agentId: MANAGER_AGENT_ID },
+        { sessionKey: `agent:${task.assignedAgentId || task.agentId || MANAGER_AGENT_ID}:${task.id}`, agentId: task.assignedAgentId || task.agentId || MANAGER_AGENT_ID }
+    ];
+
+    for (const target of sessionTargets) {
+        try {
+            const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey: target.sessionKey });
+            const messages = history?.payload?.messages || history?.payload || [];
+            if (!Array.isArray(messages) || !messages.length) continue;
+
+            const extractedNarrative = messages
+                .map((entry) => summarizeTaskHistoryMessage({
+                    message: entry?.message && typeof entry.message === 'object' ? { ...entry.message, timestamp: entry.timestamp || entry.message.timestamp } : entry,
+                    fallbackAgentId: target.agentId
+                }))
+                .filter(Boolean);
+            narrative.push(...extractedNarrative);
+
+            if (includeLog) {
+                for (const entry of messages) {
+                    const message = entry?.message && typeof entry.message === 'object' ? entry.message : entry;
+                    const role = String(message?.role || '').toLowerCase();
+                    if (role === 'toolresult' || role === 'tool_result' || role === 'tool') {
+                        const toolText = extractContent(message.content || entry.content || '');
+                        if (toolText) {
+                            log.push({
+                                ts: entry.timestamp || message.timestamp || null,
+                                role: 'tool',
+                                toolName: message.toolName || entry.toolName || 'tool',
+                                text: toolText
+                            });
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Keep the stored task narrative if history is unavailable.
+        }
+    }
+
+    const mergedNarrative = mergeNarrativeEntries(narrative);
+    const latestNarrative = mergedNarrative[mergedNarrative.length - 1] || null;
+
+    const enriched = {
+        ...task,
+        narrative: mergedNarrative,
+    };
+
+    if (includeLog) {
+        enriched.log = dedupeNarrativeEntries(log.map((entry) => ({
+            ts: entry.ts,
+            agentId: entry.agentId,
+            role: entry.role,
+            text: entry.text,
+            toolName: entry.toolName
+        }))).map((entry) => ({
+            ts: entry.ts,
+            role: entry.role,
+            text: entry.text,
+            toolName: entry.toolName
+        }));
+    }
+
+    if (latestNarrative?.text) {
+        enriched.lastDecision = {
+            ts: latestNarrative.ts || task?.updatedAt || null,
+            reason: latestNarrative.text
+        };
+        enriched.lastRun = {
+            ...(task?.lastRun || {}),
+            ts: latestNarrative.ts || task?.updatedAt || null,
+            summary: latestNarrative.text
+        };
+    }
+
+    return enriched;
+}
+
 function mapSessionToJob(session, key) {
     const sessionKey = key || session.key || '';
     const agentId = sessionKey.split(':')[1] || 'main';
@@ -2565,7 +2734,16 @@ app.post('/api/internal/tasks-list', requireInternal, async (req, res) => {
         .sort((a, b) => String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || '')))
         .slice(0, max);
 
-    const jobs = tasks.map((task) => mapStoredTaskToJob(task, { includeNarrative, includeLog }));
+    const tasksToMap = [];
+    for (const task of tasks) {
+        if (includeNarrative || includeLog || requestedIds) {
+            tasksToMap.push(await enrichStoredTaskWithGatewayHistory(instanceId, task, { includeLog }));
+        } else {
+            tasksToMap.push(task);
+        }
+    }
+
+    const jobs = tasksToMap.map((task) => mapStoredTaskToJob(task, { includeNarrative, includeLog }));
     res.json({ jobs });
 });
 
