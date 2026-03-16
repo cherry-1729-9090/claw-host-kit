@@ -485,11 +485,156 @@ async function autoRegisterWithControlPlane() {
 
 const OPENCLAW_BIN = '/home/node/.npm-global/bin/openclaw';
 const INSTANCES_DIR = '/var/lib/openclaw/instances';
+const TASKS_STORE_FILE = 'mission-control-tasks.json';
 
 function readInstanceConfig(instanceId) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     if (!fs.existsSync(configPath)) return null;
     try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
+}
+
+function getTasksStorePath(instanceId) {
+    return path.join(INSTANCES_DIR, instanceId, TASKS_STORE_FILE);
+}
+
+function readTasksStore(instanceId) {
+    const storePath = getTasksStorePath(instanceId);
+    if (!fs.existsSync(storePath)) return [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function writeTasksStore(instanceId, tasks) {
+    fs.writeFileSync(getTasksStorePath(instanceId), JSON.stringify(tasks, null, 2) + '\n', 'utf8');
+}
+
+function upsertTaskRecord(instanceId, taskRecord) {
+    const tasks = readTasksStore(instanceId);
+    const nextTasks = tasks.filter((task) => task?.id !== taskRecord.id);
+    nextTasks.unshift(taskRecord);
+    writeTasksStore(instanceId, nextTasks.slice(0, 1000));
+}
+
+function extractJsonObject(rawOutput) {
+    const text = String(rawOutput || '').trim();
+    if (!text) return null;
+
+    const lines = text.split('\n');
+    for (let index = 0; index < lines.length; index += 1) {
+        const candidate = lines.slice(index).join('\n').trim();
+        if (!candidate.startsWith('{')) continue;
+        try {
+            return JSON.parse(candidate);
+        } catch {
+            continue;
+        }
+    }
+
+    return null;
+}
+
+function mapStoredTaskToJob(task, options = {}) {
+    const { includeNarrative = false, includeLog = false } = options;
+    const narrative = Array.isArray(task?.narrative) ? task.narrative : [];
+    const log = Array.isArray(task?.log) ? task.log : [];
+
+    const metadata = {
+        status: task?.status || 'assigned',
+        agentId: task?.agentId || 'main',
+        priority: Number(task?.priority) || 3,
+        createdAt: task?.createdAt || null,
+        updatedAt: task?.updatedAt || null,
+        message: task?.message || '',
+        channel: 'mission-control',
+        lastRun: task?.lastRun || null
+    };
+
+    if (includeNarrative) metadata.narrative = narrative;
+    if (includeLog) metadata.log = log;
+    if (task?.lastDecision) metadata.lastDecision = task.lastDecision;
+
+    return {
+        id: task.id,
+        name: task.name || task.id,
+        status: task.status || 'assigned',
+        agentId: task.agentId || 'main',
+        model: task.model || '',
+        payload: {
+            message: task.message || ''
+        },
+        metadata
+    };
+}
+
+async function executeTaskRecord(instanceId, taskRecord) {
+    const containerName = `openclaw-${instanceId}`;
+    const startedAt = new Date().toISOString();
+    upsertTaskRecord(instanceId, {
+        ...taskRecord,
+        status: 'picked_up',
+        updatedAt: startedAt,
+        log: [...(taskRecord.log || []), { ts: startedAt, role: 'system', text: 'Task picked up by agent runtime' }]
+    });
+
+    try {
+        const output = await runDockerExec(containerName, [
+            'agent',
+            '--agent', taskRecord.agentId || 'main',
+            '--session-id', taskRecord.id,
+            '--message', taskRecord.message,
+            '--json'
+        ]);
+
+        const parsed = extractJsonObject(output);
+        const summary = parsed?.payloads?.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
+            || parsed?.meta?.lastDecision?.reason
+            || 'Task completed';
+        const finishedAt = new Date().toISOString();
+        const modelProvider = parsed?.meta?.agentMeta?.provider || '';
+        const modelName = parsed?.meta?.agentMeta?.model || '';
+        const resolvedModel = modelProvider && modelName ? `${modelProvider}/${modelName}` : (taskRecord.model || '');
+
+        upsertTaskRecord(instanceId, {
+            ...taskRecord,
+            status: 'completed',
+            updatedAt: finishedAt,
+            model: resolvedModel,
+            narrative: summary ? [{ ts: finishedAt, agentId: taskRecord.agentId || 'main', role: 'assistant', text: summary }] : [],
+            lastDecision: summary ? { ts: finishedAt, reason: summary } : null,
+            lastRun: {
+                ts: finishedAt,
+                summary,
+                output,
+                error: null
+            },
+            log: [
+                ...(taskRecord.log || []),
+                { ts: startedAt, role: 'system', text: 'Task execution started' },
+                { ts: finishedAt, role: 'assistant', text: summary || 'Task completed' }
+            ]
+        });
+    } catch (err) {
+        const finishedAt = new Date().toISOString();
+        upsertTaskRecord(instanceId, {
+            ...taskRecord,
+            status: 'failed',
+            updatedAt: finishedAt,
+            lastRun: {
+                ts: finishedAt,
+                summary: '',
+                error: err.message
+            },
+            log: [
+                ...(taskRecord.log || []),
+                { ts: startedAt, role: 'system', text: 'Task execution started' },
+                { ts: finishedAt, role: 'system', text: `Task failed: ${err.message}` }
+            ]
+        });
+    }
 }
 
 function sanitizeAllowedModelsMap(models) {
@@ -1775,6 +1920,77 @@ app.post('/api/internal/chat-send', requireInternal, async (req, res) => {
         console.error(`[vps-agent] chat-send failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
     }
+});
+
+app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
+    const { instanceId, message, agentId, priority, name } = req.body || {};
+    if (!instanceId || !message) {
+        return res.status(400).json({ error: 'instanceId and message are required' });
+    }
+
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date().toISOString();
+    const config = readInstanceConfig(instanceId);
+    const defaultsModel = config?.agents?.defaults?.model || {};
+    const configuredAgent = Array.isArray(config?.agents?.list)
+        ? config.agents.list.find((agent) => agent?.id === (agentId || 'main'))
+        : null;
+    const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaultsModel).primary;
+
+    const taskRecord = {
+        id: taskId,
+        name: String(name || `Task: ${String(message).slice(0, 60)}`).trim(),
+        message: String(message).trim(),
+        agentId: String(agentId || 'main').trim() || 'main',
+        priority: Number(priority) || 3,
+        status: 'assigned',
+        createdAt: now,
+        updatedAt: now,
+        model: resolvedModel,
+        narrative: [],
+        log: [
+            { ts: now, role: 'system', text: 'Task created from Mission Control' }
+        ],
+        lastRun: null,
+        lastDecision: null
+    };
+
+    upsertTaskRecord(instanceId, taskRecord);
+
+    queueMicrotask(() => {
+        executeTaskRecord(instanceId, taskRecord).catch((err) => {
+            console.error(`[vps-agent] async task execution failed for ${instanceId}/${taskId}:`, err.message);
+        });
+    });
+
+    return res.json({
+        ok: true,
+        taskId,
+        sessionKey: `agent:${taskRecord.agentId}:${taskId}`,
+        status: taskRecord.status
+    });
+});
+
+app.post('/api/internal/tasks-list', requireInternal, async (req, res) => {
+    const { instanceId, ids, limit, includeNarrative, includeLog } = req.body || {};
+    if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
+
+    const requestedIds = typeof ids === 'string' && ids.trim()
+        ? new Set(ids.split(',').map((value) => value.trim()).filter(Boolean))
+        : null;
+    const max = Math.max(1, Math.min(Number(limit) || 100, 1000));
+
+    let tasks = readTasksStore(instanceId);
+    if (requestedIds) {
+        tasks = tasks.filter((task) => requestedIds.has(task.id));
+    }
+
+    tasks = tasks
+        .sort((a, b) => String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || '')))
+        .slice(0, max);
+
+    const jobs = tasks.map((task) => mapStoredTaskToJob(task, { includeNarrative, includeLog }));
+    res.json({ jobs });
 });
 
 // ── Agent delete (WebSocket agents.delete) ───────────────────────────────────
