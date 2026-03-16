@@ -36,6 +36,11 @@ const COMPOSIO_SERVER_NAME = 'composio';
 const COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
 const COMPOSIO_HEADER_NAME = 'x-consumer-api-key';
 const COMPOSIO_API_KEY = process.env.OPENCLAW_COMPOSIO_API_KEY || '';
+const DEFAULT_PROVIDER_KEY = process.env.OPENCLAW_DEFAULT_PROVIDER_KEY || 'cloudflare-nemotron';
+const DEFAULT_PROVIDER_BASE_URL = process.env.OPENCLAW_DEFAULT_PROVIDER_BASE_URL || '';
+const DEFAULT_PROVIDER_API_KEY = process.env.OPENCLAW_DEFAULT_PROVIDER_API_KEY || '';
+const DEFAULT_PROVIDER_API = process.env.OPENCLAW_DEFAULT_PROVIDER_API || 'openai-completions';
+const DEFAULT_PRIMARY_MODEL_RAW = process.env.OPENCLAW_DEFAULT_PRIMARY_MODEL || `${DEFAULT_PROVIDER_KEY}/workers-ai/@cf/nvidia/nemotron-3-120b-a12b`;
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -352,6 +357,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
 
         const mem0 = await ensureMem0ForInstance(instanceId);
         const composio = await ensureComposioForInstance(instanceId);
+        const defaultModel = await ensureDefaultModelForInstance(instanceId);
 
         const result = {
             ok: true,
@@ -360,6 +366,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             gatewayToken,
             mem0,
             composio,
+            defaultModel,
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
         };
@@ -876,6 +883,134 @@ function normalizeCustomProviderModelId(providerKey, rawId) {
     return `${providerKey}/${suffix}`;
 }
 
+function normalizeDefaultPrimaryModel(providerKey, rawModel, baseUrl) {
+    const trimmed = String(rawModel || '').trim();
+    if (!trimmed) return '';
+
+    let normalized = trimmed;
+    if (!normalized.startsWith(`${providerKey}/`)) {
+        normalized = normalizeCustomProviderModelId(providerKey, normalized);
+    }
+
+    if (String(baseUrl || '').includes('gateway.ai.cloudflare.com')) {
+        const prefix = `${providerKey}/`;
+        const suffix = normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
+        if (suffix.startsWith('@cf/')) {
+            return `${providerKey}/workers-ai/${suffix}`;
+        }
+    }
+
+    return normalized;
+}
+
+function getDefaultModelDefinition() {
+    if (!DEFAULT_PROVIDER_BASE_URL || !DEFAULT_PROVIDER_API_KEY) return null;
+
+    const providerKey = String(DEFAULT_PROVIDER_KEY || '').trim();
+    if (!providerKey) return null;
+
+    const baseUrl = String(DEFAULT_PROVIDER_BASE_URL || '').trim();
+    const apiKey = String(DEFAULT_PROVIDER_API_KEY || '').trim();
+    if (!baseUrl || !apiKey) return null;
+
+    const primaryModel = normalizeDefaultPrimaryModel(providerKey, DEFAULT_PRIMARY_MODEL_RAW, baseUrl);
+    if (!primaryModel) return null;
+
+    return {
+        providerKey,
+        baseUrl,
+        api: normalizeCustomProviderApi(DEFAULT_PROVIDER_API),
+        apiKey,
+        primaryModel,
+    };
+}
+
+async function applyConfigReload(instanceId, config = null) {
+    const resolvedConfig = config || readInstanceConfig(instanceId);
+    if (!resolvedConfig) return;
+
+    try {
+        const gatewayToken = resolvedConfig.gateway?.auth?.token || await getGatewayToken(`openclaw-${instanceId}`);
+        if (gatewayToken) {
+            await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'config.apply', {});
+        }
+    } catch (err) {
+        console.warn(`[vps-agent] config.apply skipped for ${instanceId}: ${err.message}`);
+    }
+}
+
+function upsertAllowedModel(config, modelId) {
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.models = config.agents.defaults.models || {};
+    config.agents.defaults.models[modelId] = { enabled: true };
+}
+
+async function ensureDefaultModelForInstance(instanceId, { force = true } = {}) {
+    const definition = getDefaultModelDefinition();
+    if (!definition) {
+        return { enabled: false, reason: 'missing-default-model-env' };
+    }
+
+    const config = readInstanceConfig(instanceId);
+    if (!config) {
+        return { enabled: false, reason: 'config-not-found' };
+    }
+
+    config.models = config.models || {};
+    config.models.mode = config.models.mode || 'merge';
+    config.models.providers = config.models.providers || {};
+
+    const currentPrimary = config.agents?.defaults?.model?.primary || '';
+    if (!force && currentPrimary && currentPrimary !== definition.primaryModel) {
+        return {
+            enabled: false,
+            reason: 'primary-already-set',
+            currentPrimary,
+        };
+    }
+
+    config.models.providers[definition.providerKey] = {
+        baseUrl: definition.baseUrl,
+        apiKey: definition.apiKey,
+        api: definition.api,
+        models: [
+            {
+                id: definition.primaryModel,
+                name: definition.primaryModel.slice(definition.providerKey.length + 1),
+            },
+        ],
+    };
+
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.model = {
+        primary: definition.primaryModel,
+        fallbacks: [],
+    };
+    upsertAllowedModel(config, definition.primaryModel);
+
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+    const mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
+    if (mainAgent) {
+        mainAgent.model = definition.primaryModel;
+    } else {
+        config.agents.list.unshift({
+            id: 'main',
+            model: definition.primaryModel,
+        });
+    }
+
+    writeInstanceConfig(instanceId, config);
+    await applyConfigReload(instanceId, config);
+
+    return {
+        enabled: true,
+        providerKey: definition.providerKey,
+        primaryModel: definition.primaryModel,
+    };
+}
+
 // ── Custom provider config ────────────────────────────────────────────────────
 app.post('/api/internal/configure-custom-provider', requireInternal, async (req, res) => {
     const { instanceId, key, label, baseUrl, api, apiKey, authHeader, headers, models } = req.body;
@@ -931,20 +1066,35 @@ app.post('/api/internal/configure-custom-provider', requireInternal, async (req,
 
         writeInstanceConfig(instanceId, config);
 
-        try {
-            const gatewayToken = config.gateway?.auth?.token || await getGatewayToken(`openclaw-${instanceId}`);
-            if (gatewayToken) {
-                await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'config.apply', {});
-            }
-        } catch (err) {
-            console.warn(`[vps-agent] custom provider config.apply skipped for ${instanceId}: ${err.message}`);
-        }
+        await applyConfigReload(instanceId, config);
 
         console.log(`[vps-agent] custom provider ${key} configured for ${instanceId}`);
         res.json({ success: true, providerKey: key, provider });
     } catch (err) {
         console.error(`[vps-agent] configure-custom-provider failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/internal/backfill-default-model', requireInternal, async (req, res) => {
+    const { instanceId, force = true } = req.body || {};
+
+    try {
+        if (instanceId) {
+            const result = await ensureDefaultModelForInstance(instanceId, { force: force !== false });
+            return res.json({ ok: true, updated: [result] });
+        }
+
+        const instanceIds = listInstanceIds();
+        const updated = [];
+        for (const currentInstanceId of instanceIds) {
+            updated.push(await ensureDefaultModelForInstance(currentInstanceId, { force: force !== false }));
+        }
+
+        return res.json({ ok: true, updated });
+    } catch (err) {
+        console.error('[vps-agent] backfill-default-model failed:', err.message);
+        return res.status(500).json({ error: err.message });
     }
 });
 
