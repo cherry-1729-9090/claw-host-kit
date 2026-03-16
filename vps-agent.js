@@ -939,6 +939,74 @@ function parseTaskOutcome(text) {
     };
 }
 
+function extractUrlsFromText(text) {
+    const matches = String(text || '').match(/https?:\/\/[^\s)"'`]+/g);
+    return matches ? Array.from(new Set(matches)) : [];
+}
+
+function summarizeToolFailures(output) {
+    const text = String(output || '');
+    const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+    const errorLines = lines.filter((line) =>
+        /MCP error|Tool .* not found|No connection found|Authentication in progress|waiting for user to complete|missing scope|failed/i.test(line)
+    );
+    return Array.from(new Set(errorLines)).slice(-5);
+}
+
+function inferExternalActionGuards({ requirements, workerRun }) {
+    const output = String(workerRun?.output || '');
+    const text = String(workerRun?.text || '');
+    const mergedText = `${text}\n${output}`;
+    const urls = extractUrlsFromText(mergedText);
+    const errors = summarizeToolFailures(output);
+    const requiredApps = normalizeTagList(requirements?.requiredApps || []);
+    const highRiskActions = normalizeTagList(requirements?.highRiskActions || []);
+    const needsExternalAction = Boolean(requirements?.needsExternalAction);
+
+    if (!needsExternalAction) {
+        return { status: null, summary: '', evidence: [], needs: [], followUps: [] };
+    }
+
+    const hasConnectionIssue = /No connection found|Authentication in progress|waiting for user to complete|authorize|not initiated/i.test(mergedText);
+
+    if (requiredApps.includes('notion')) {
+        const mentionsCreatedPage = /created?.{0,40}notion page|page creation|document created|created successfully/i.test(mergedText);
+        const hasNotionUrl = urls.some((url) => /notion\.so/i.test(url));
+
+        if (hasConnectionIssue) {
+            return {
+                status: 'awaiting_connection',
+                summary: 'Notion is not fully connected for this user session yet.',
+                evidence: errors,
+                needs: ['A valid user-scoped Notion connection for this Mission Control user.'],
+                followUps: ['Reconnect Notion from Mission Control and refresh the instance MCP session before retrying.']
+            };
+        }
+
+        if (mentionsCreatedPage && !hasNotionUrl) {
+            return {
+                status: 'failed',
+                summary: 'The run claimed a Notion page was created, but it did not return a Notion page URL.',
+                evidence: [...errors, ...urls].slice(0, 5),
+                needs: ['A verifiable Notion page URL or page ID from the tool result.'],
+                followUps: ['Retry page creation and only mark the task complete after returning the Notion page URL.']
+            };
+        }
+    }
+
+    if ((requiredApps.length > 0 || highRiskActions.length > 0) && errors.length) {
+        return {
+            status: 'failed',
+            summary: 'The run hit tool errors while attempting the external action.',
+            evidence: errors,
+            needs: requiredApps,
+            followUps: ['Resolve the tool error and retry with a verified outcome.']
+        };
+    }
+
+    return { status: null, summary: '', evidence: [], needs: [], followUps: [] };
+}
+
 function mapStoredTaskToJob(task, options = {}) {
     const { includeNarrative = false, includeLog = false } = options;
     const narrative = Array.isArray(task?.narrative) ? task.narrative : [];
@@ -1208,6 +1276,10 @@ async function executeTaskRecord(instanceId, taskRecord) {
             '{"status":"completed|blocked|awaiting_connection|awaiting_approval|failed","summary":"what happened","needs":["missing dependency or approval"],"evidence":["proof points"],"followUps":["next actions"]}',
             'Rules:',
             '- Do not claim completion unless the outcome actually happened.',
+            '- For any external action, include concrete evidence from the tool result.',
+            '- If you create a Notion page, include the final Notion page URL in evidence.',
+            '- If the same tool fails twice with the same or similar error, stop retrying and return blocked or awaiting_connection.',
+            '- Do not say "in progress" or "should complete shortly". Return only the current verified state.',
             '- If a required app/account/tool is missing, use awaiting_connection.',
             '- If a human needs to review or approve before sending/posting/deleting, use awaiting_approval.',
             '- If this task should be reassigned or cannot be completed by you, use blocked and explain why.'
@@ -1230,11 +1302,16 @@ async function executeTaskRecord(instanceId, taskRecord) {
             message: workerPrompt
         });
         const outcome = parseTaskOutcome(workerRun.text);
+        const guard = inferExternalActionGuards({ requirements, workerRun });
         const finishedAt = new Date().toISOString();
-        const finalStatus = ['completed', 'blocked', 'awaiting_connection', 'awaiting_approval', 'failed'].includes(outcome.status)
-            ? outcome.status
-            : 'completed';
-        const finalSummary = outcome.summary || 'Task run completed without a structured summary.';
+        const finalStatus = guard.status
+            || (['completed', 'blocked', 'awaiting_connection', 'awaiting_approval', 'failed'].includes(outcome.status)
+                ? outcome.status
+                : 'failed');
+        const finalSummary = guard.summary || outcome.summary || 'Task run finished without a verifiable structured outcome.';
+        const finalNeeds = guard.needs?.length ? guard.needs : outcome.needs;
+        const finalEvidence = guard.evidence?.length ? guard.evidence : outcome.evidence;
+        const finalFollowUps = guard.followUps?.length ? guard.followUps : outcome.followUps;
         const narrative = [
             managerNarrative,
             {
@@ -1265,9 +1342,9 @@ async function executeTaskRecord(instanceId, taskRecord) {
                 summary: finalSummary,
                 output: workerRun.output,
                 error: null,
-                needs: outcome.needs,
-                evidence: outcome.evidence,
-                followUps: outcome.followUps
+                needs: finalNeeds,
+                evidence: finalEvidence,
+                followUps: finalFollowUps
             },
             log: [
                 ...assignedTaskRecord.log,
