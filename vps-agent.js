@@ -1192,15 +1192,47 @@ app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
     const config = readInstanceConfig(instanceId);
     if (!config) return res.status(404).json({ error: 'Config not found' });
     const gatewayToken = config.gateway?.auth?.token;
-    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+    const configuredAgents = Array.isArray(config.agents?.list)
+        ? config.agents.list
+            .filter((agent) => agent && typeof agent === 'object' && agent.id)
+            .map((agent) => ({
+                id: agent.id,
+                name: agent.name || agent.id,
+                workspace: agent.workspace,
+                agentDir: agent.agentDir,
+                model: agent.model || '',
+                source: 'config'
+            }))
+        : [];
+
+    if (!gatewayToken) {
+        return res.json({ agents: configuredAgents });
+    }
 
     try {
         const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.list', {});
-        const agents = result?.payload?.agents || result?.payload || [];
-        res.json({ agents: Array.isArray(agents) ? agents : [] });
+        const gatewayAgents = result?.payload?.agents || result?.payload || [];
+        const merged = new Map();
+
+        for (const agent of configuredAgents) {
+            merged.set(agent.id, agent);
+        }
+
+        if (Array.isArray(gatewayAgents)) {
+            for (const agent of gatewayAgents) {
+                if (!agent?.id) continue;
+                merged.set(agent.id, {
+                    ...merged.get(agent.id),
+                    ...agent,
+                    source: merged.has(agent.id) ? 'config+gateway' : 'gateway'
+                });
+            }
+        }
+
+        res.json({ agents: Array.from(merged.values()) });
     } catch (err) {
         console.error(`[vps-agent] agents-list failed for ${instanceId}:`, err.message);
-        res.status(500).json({ error: err.message });
+        res.json({ agents: configuredAgents, warning: err.message });
     }
 });
 
@@ -1646,59 +1678,41 @@ app.post('/api/internal/agents-delete', requireInternal, async (req, res) => {
 
 // ── Sub-agent spawn (agents.create + chat.send via WebSocket) ────────────────
 app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
-    const { instanceId, task, label, model } = req.body;
-    if (!instanceId || !task) {
-        return res.status(400).json({ error: 'instanceId and task are required' });
+    const { instanceId, initialTask, label, model, identityMd, soulMd, agentsMd } = req.body;
+    if (!instanceId) {
+        return res.status(400).json({ error: 'instanceId is required' });
+    }
+    if (![label, identityMd, soulMd, agentsMd, initialTask].some((value) => String(value || '').trim())) {
+        return res.status(400).json({ error: 'Provide at least a label or one agent profile field' });
     }
     const config = readInstanceConfig(instanceId);
     if (!config) return res.status(404).json({ error: 'Config not found' });
 
     const gatewayToken = config.gateway?.auth?.token;
-    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
-
     const container = `openclaw-${instanceId}`;
     const agentId = (label || 'sub-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
 
     try {
-        // Step 1: Create the agent
-        const createResult = await gatewayWsExec(container, gatewayToken, 'agents.create', {
-            name: agentId,
-            workspace: `/home/node/.openclaw/agents/${agentId}`
+        const setup = await createAgentViaConfig(instanceId, agentId, {
+            label,
+            model,
+            identityMd,
+            soulMd,
+            agentsMd
         });
-        console.log(`[vps-agent] agent created ${agentId}:`, JSON.stringify(createResult).slice(0, 200));
 
-        if (!createResult.ok && createResult.error) {
-            const createError = createResult.error?.message || 'Failed to create agent';
-            if (String(createError).includes('missing scope: operator.admin')) {
-                console.warn(`[vps-agent] agents.create is admin-gated for ${instanceId}; using config fallback for ${agentId}`);
-                const fallback = await createAgentViaConfig(instanceId, agentId, label, model);
-                const chatResult = await dispatchAgentTask(container, gatewayToken, agentId, task);
-                return res.json({
-                    ok: true,
-                    mode: 'config-fallback',
-                    agent: { id: agentId, name: label || agentId },
-                    setup: fallback,
-                    chat: chatResult?.payload || chatResult
-                });
-            }
-            return res.status(400).json({ error: createError });
+        let chat = null;
+        if (String(initialTask || '').trim()) {
+            chat = await dispatchAgentTask(container, gatewayToken, agentId, initialTask);
+            console.log(`[vps-agent] initial task dispatched to ${agentId}:`, JSON.stringify(chat).slice(0, 200));
         }
-
-        try {
-            const agentWorkspaceDir = path.join(INSTANCES_DIR, instanceId, 'agents', agentId);
-            await ensureComposioForInstance(instanceId, [agentWorkspaceDir]);
-        } catch (err) {
-            console.warn(`[vps-agent] composio setup skipped for ${instanceId}/${agentId}: ${err.message}`);
-        }
-
-        // Step 2: Send the initial task message
-        const chatResult = await dispatchAgentTask(container, gatewayToken, agentId, task);
-        console.log(`[vps-agent] chat.send to ${agentId}:`, JSON.stringify(chatResult).slice(0, 200));
 
         res.json({
             ok: true,
+            mode: 'config-fallback',
             agent: { id: agentId, name: label || agentId },
-            chat: chatResult?.payload || chatResult
+            setup,
+            chat
         });
     } catch (err) {
         console.error(`[vps-agent] subagents-spawn failed for ${instanceId}:`, err.message);
@@ -1745,6 +1759,44 @@ function ensureAgentListEntry(config, agentId, label, model) {
     config.agents.list.push(next);
 }
 
+function writeAgentProfileFiles(workspaceDir, { label, identityMd, soulMd, agentsMd }) {
+    const normalizedLabel = String(label || '').trim() || 'Specialist agent';
+    const files = [
+        {
+            name: 'IDENTITY.md',
+            content: String(identityMd || '').trim() || [
+                `# ${normalizedLabel}`,
+                '',
+                `You are ${normalizedLabel}.`,
+                'Own the domain you were created for, communicate clearly, and stay aligned with the workspace mission.'
+            ].join('\n')
+        },
+        {
+            name: 'SOUL.md',
+            content: String(soulMd || '').trim() || [
+                '# Working Style',
+                '',
+                'Operate with calm judgment, evidence-driven thinking, and direct communication.',
+                'Prefer depth over speed when the task is ambiguous, and summarize tradeoffs clearly.'
+            ].join('\n')
+        },
+        {
+            name: 'AGENTS.md',
+            content: String(agentsMd || '').trim() || [
+                '# Operating Rules',
+                '',
+                `You are the ${normalizedLabel} agent.`,
+                'Start by clarifying the objective, gather the strongest evidence available, and produce structured outputs.',
+                'Escalate uncertainties instead of guessing, and keep notes concise and useful for the rest of the team.'
+            ].join('\n')
+        }
+    ];
+
+    for (const file of files) {
+        fs.writeFileSync(path.join(workspaceDir, file.name), `${file.content.trim()}\n`, 'utf8');
+    }
+}
+
 function ensureAgentWorkspaceOnDisk(instanceId, agentId) {
     const instanceRoot = path.join(INSTANCES_DIR, instanceId);
     const sourceWorkspace = path.join(instanceRoot, 'workspace');
@@ -1783,11 +1835,13 @@ function ensureAgentWorkspaceOnDisk(instanceId, agentId) {
     return targetWorkspace;
 }
 
-async function createAgentViaConfig(instanceId, agentId, label, model) {
+async function createAgentViaConfig(instanceId, agentId, options = {}) {
+    const { label, model, identityMd, soulMd, agentsMd } = options;
     const config = readInstanceConfig(instanceId);
     if (!config) throw new Error('Config not found');
 
     const targetWorkspace = ensureAgentWorkspaceOnDisk(instanceId, agentId);
+    writeAgentProfileFiles(targetWorkspace, { label, identityMd, soulMd, agentsMd });
     await ensureWorkspaceOwnership(targetWorkspace);
     ensureAgentListEntry(config, agentId, label, model);
     writeInstanceConfig(instanceId, config);
