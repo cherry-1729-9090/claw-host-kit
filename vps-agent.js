@@ -1244,23 +1244,28 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
     if (!config) return res.status(404).json({ error: 'Config not found' });
 
     const defaults = config.agents?.defaults || {};
-    const agentOverrides = config.agents?.agents?.[agentId] || {};
-
-    // Merge defaults + agent-specific overrides
-    const model = agentOverrides.model || defaults.model || {};
-    const identity = agentOverrides.identity || defaults.identity || {};
+    const configuredAgents = Array.isArray(config.agents?.list) ? config.agents.list : [];
+    const configuredAgent = configuredAgents.find((agent) => agent?.id === agentId) || null;
+    const profile = readAgentProfile(instanceId, agentId);
+    const defaultModel = defaults.model || {};
+    const primaryModel = configuredAgent?.model || defaultModel.primary || '';
+    const identityName = configuredAgent?.name || profile.identityName || defaults.identity?.name || '';
+    const identityEmoji = defaults.identity?.emoji || '';
 
     res.json({
         id: agentId,
         agentId,
-        model: typeof model === 'string' ? model : {
-            primary: model.primary || '',
-            fallbacks: model.fallbacks || []
+        workspace: configuredAgent?.workspace || getAgentContainerWorkspace(agentId),
+        default: agentId === 'main',
+        model: {
+            primary: primaryModel,
+            fallbacks: Array.isArray(defaultModel.fallbacks) ? defaultModel.fallbacks : []
         },
         identity: {
-            name: identity.name || '',
-            emoji: identity.emoji || ''
-        }
+            name: identityName,
+            emoji: identityEmoji
+        },
+        files: profile.files
     });
 });
 
@@ -1277,30 +1282,44 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
 
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
-
-    // OpenClaw only supports agents.defaults — no per-agent overrides in config
-    const target = config.agents.defaults;
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
 
     // Clean up any previously written invalid key
     if (config.agents.agents) delete config.agents.agents;
 
-    if (updates.model) {
-        target.model = target.model || {};
-        if (updates.model.primary !== undefined) target.model.primary = updates.model.primary;
-        if (updates.model.fallbacks !== undefined) target.model.fallbacks = updates.model.fallbacks;
+    if (agentId === 'main') {
+        const target = config.agents.defaults;
+        if (updates.model) {
+            target.model = target.model || {};
+            if (updates.model.primary !== undefined) target.model.primary = updates.model.primary;
+            if (updates.model.fallbacks !== undefined) target.model.fallbacks = updates.model.fallbacks;
 
-        if (agentId === 'main') {
-            config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
             const mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
             if (mainAgent && updates.model.primary !== undefined) {
                 mainAgent.model = updates.model.primary;
             }
         }
-    }
-    if (updates.identity) {
-        target.identity = target.identity || {};
-        if (updates.identity.name !== undefined) target.identity.name = updates.identity.name;
-        if (updates.identity.emoji !== undefined) target.identity.emoji = updates.identity.emoji;
+        if (updates.identity) {
+            target.identity = target.identity || {};
+            if (updates.identity.name !== undefined) target.identity.name = updates.identity.name;
+            if (updates.identity.emoji !== undefined) target.identity.emoji = updates.identity.emoji;
+        }
+    } else {
+        const agentEntry = config.agents.list.find((agent) => agent?.id === agentId);
+        if (!agentEntry) {
+            return res.status(404).json({ error: `Agent "${agentId}" not found` });
+        }
+
+        if (updates.model && updates.model.primary !== undefined) {
+            if (String(updates.model.primary || '').trim()) agentEntry.model = updates.model.primary;
+            else delete agentEntry.model;
+        }
+
+        if (updates.identity && updates.identity.name !== undefined) {
+            const nextName = String(updates.identity.name || '').trim();
+            agentEntry.name = nextName || agentEntry.id;
+            syncAgentIdentityName(instanceId, agentId, agentEntry.name);
+        }
     }
 
     try {
@@ -1312,8 +1331,24 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
         if (gatewayToken) {
             gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'config.apply', {}).catch(() => {});
         }
-
-        res.json({ ok: true, agent: { id: agentId, model: target.model, identity: target.identity } });
+        const refreshed = readAgentProfile(instanceId, agentId);
+        const currentAgent = config.agents.list.find((agent) => agent?.id === agentId) || {};
+        const defaults = config.agents.defaults || {};
+        res.json({
+            ok: true,
+            agent: {
+                id: agentId,
+                model: {
+                    primary: currentAgent.model || defaults.model?.primary || '',
+                    fallbacks: Array.isArray(defaults.model?.fallbacks) ? defaults.model.fallbacks : []
+                },
+                identity: {
+                    name: currentAgent.name || refreshed.identityName || defaults.identity?.name || '',
+                    emoji: defaults.identity?.emoji || ''
+                },
+                files: refreshed.files
+            }
+        });
     } catch (err) {
         console.error(`[vps-agent] agent-config-update write failed:`, err.message);
         res.status(500).json({ error: err.message });
@@ -1734,6 +1769,58 @@ function getAgentContainerWorkspace(agentId) {
 
 function getAgentHostWorkspace(instanceId, agentId) {
     return path.join(INSTANCES_DIR, instanceId, 'agents', agentId);
+}
+
+function readTextFileIfExists(filePath) {
+    try {
+        return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+    } catch {
+        return '';
+    }
+}
+
+function extractIdentityNameFromMarkdown(markdown) {
+    const heading = String(markdown || '').match(/^#\s+(.+)$/m);
+    return heading?.[1]?.trim() || '';
+}
+
+function readAgentProfile(instanceId, agentId) {
+    const workspace = getAgentHostWorkspace(instanceId, agentId);
+    const identityMd = readTextFileIfExists(path.join(workspace, 'IDENTITY.md'));
+    const soulMd = readTextFileIfExists(path.join(workspace, 'SOUL.md'));
+    const agentsMd = readTextFileIfExists(path.join(workspace, 'AGENTS.md'));
+
+    return {
+        identityName: extractIdentityNameFromMarkdown(identityMd),
+        files: {
+            identityMd,
+            soulMd,
+            agentsMd
+        }
+    };
+}
+
+function syncAgentIdentityName(instanceId, agentId, nextName) {
+    const workspace = getAgentHostWorkspace(instanceId, agentId);
+    const identityPath = path.join(workspace, 'IDENTITY.md');
+    const current = readTextFileIfExists(identityPath);
+    if (!current) return;
+
+    const trimmedName = String(nextName || '').trim();
+    if (!trimmedName) return;
+
+    let updated = current;
+    if (/^#\s+.+$/m.test(updated)) {
+        updated = updated.replace(/^#\s+.+$/m, `# ${trimmedName}`);
+    } else {
+        updated = `# ${trimmedName}\n\n${updated}`;
+    }
+
+    if (/^You are .+\.$/m.test(updated)) {
+        updated = updated.replace(/^You are .+\.$/m, `You are ${trimmedName}.`);
+    }
+
+    fs.writeFileSync(identityPath, updated.endsWith('\n') ? updated : `${updated}\n`, 'utf8');
 }
 
 async function ensureWorkspaceOwnership(workspacePath) {
