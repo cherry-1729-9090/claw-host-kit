@@ -533,6 +533,31 @@ function sanitizeInstanceConfig(config) {
     return { config, changed };
 }
 
+function normalizeModelOverride(modelValue, defaultsModel = {}) {
+    const defaultPrimary = typeof defaultsModel === 'string'
+        ? defaultsModel
+        : String(defaultsModel?.primary || '').trim();
+    const defaultFallbacks = Array.isArray(defaultsModel?.fallbacks) ? defaultsModel.fallbacks : [];
+
+    if (typeof modelValue === 'string') {
+        return {
+            primary: modelValue.trim() || defaultPrimary,
+            fallbacks: defaultFallbacks
+        };
+    }
+
+    if (modelValue && typeof modelValue === 'object' && !Array.isArray(modelValue)) {
+        const primary = String(modelValue.primary || '').trim() || defaultPrimary;
+        const fallbacks = Array.isArray(modelValue.fallbacks) ? modelValue.fallbacks : defaultFallbacks;
+        return { primary, fallbacks };
+    }
+
+    return {
+        primary: defaultPrimary,
+        fallbacks: defaultFallbacks
+    };
+}
+
 function listAgentWorkspaceDirs(instanceId) {
     const agentsDir = path.join(INSTANCES_DIR, instanceId, 'agents');
     if (!fs.existsSync(agentsDir)) return [];
@@ -1195,14 +1220,19 @@ app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
     const configuredAgents = Array.isArray(config.agents?.list)
         ? config.agents.list
             .filter((agent) => agent && typeof agent === 'object' && agent.id)
-            .map((agent) => ({
-                id: agent.id,
-                name: agent.name || agent.id,
-                workspace: agent.workspace,
-                agentDir: agent.agentDir,
-                model: agent.model || '',
-                source: 'config'
-            }))
+            .map((agent) => {
+                const resolvedModel = normalizeModelOverride(agent.model, config.agents?.defaults?.model || {});
+                return {
+                    id: agent.id,
+                    name: agent.name || agent.id,
+                    workspace: agent.workspace,
+                    agentDir: agent.agentDir,
+                    model: resolvedModel.primary,
+                    primaryModel: resolvedModel.primary,
+                    fallbacks: resolvedModel.fallbacks,
+                    source: 'config'
+                };
+            })
         : [];
 
     if (!gatewayToken) {
@@ -1247,8 +1277,7 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
     const configuredAgents = Array.isArray(config.agents?.list) ? config.agents.list : [];
     const configuredAgent = configuredAgents.find((agent) => agent?.id === agentId) || null;
     const profile = readAgentProfile(instanceId, agentId);
-    const defaultModel = defaults.model || {};
-    const primaryModel = configuredAgent?.model || defaultModel.primary || '';
+    const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaults.model || {});
     const identityName = configuredAgent?.name || profile.identityName || defaults.identity?.name || '';
     const identityEmoji = defaults.identity?.emoji || '';
 
@@ -1258,8 +1287,8 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
         workspace: configuredAgent?.workspace || getAgentContainerWorkspace(agentId),
         default: agentId === 'main',
         model: {
-            primary: primaryModel,
-            fallbacks: Array.isArray(defaultModel.fallbacks) ? defaultModel.fallbacks : []
+            primary: resolvedModel.primary,
+            fallbacks: resolvedModel.fallbacks
         },
         identity: {
             name: identityName,
@@ -1310,9 +1339,22 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
             return res.status(404).json({ error: `Agent "${agentId}" not found` });
         }
 
-        if (updates.model && updates.model.primary !== undefined) {
-            if (String(updates.model.primary || '').trim()) agentEntry.model = updates.model.primary;
-            else delete agentEntry.model;
+        if (updates.model) {
+            const nextPrimary = updates.model.primary !== undefined
+                ? String(updates.model.primary || '').trim()
+                : normalizeModelOverride(agentEntry.model, config.agents.defaults?.model || {}).primary;
+            const nextFallbacks = updates.model.fallbacks !== undefined
+                ? (Array.isArray(updates.model.fallbacks) ? updates.model.fallbacks : [])
+                : normalizeModelOverride(agentEntry.model, config.agents.defaults?.model || {}).fallbacks;
+
+            if (nextPrimary) {
+                agentEntry.model = {
+                    primary: nextPrimary,
+                    fallbacks: nextFallbacks.filter((value) => value && value !== nextPrimary)
+                };
+            } else {
+                delete agentEntry.model;
+            }
         }
 
         if (updates.identity && updates.identity.name !== undefined) {
@@ -1334,13 +1376,14 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
         const refreshed = readAgentProfile(instanceId, agentId);
         const currentAgent = config.agents.list.find((agent) => agent?.id === agentId) || {};
         const defaults = config.agents.defaults || {};
+        const resolvedModel = normalizeModelOverride(currentAgent.model, defaults.model || {});
         res.json({
             ok: true,
             agent: {
                 id: agentId,
                 model: {
-                    primary: currentAgent.model || defaults.model?.primary || '',
-                    fallbacks: Array.isArray(defaults.model?.fallbacks) ? defaults.model.fallbacks : []
+                    primary: resolvedModel.primary,
+                    fallbacks: resolvedModel.fallbacks
                 },
                 identity: {
                     name: currentAgent.name || refreshed.identityName || defaults.identity?.name || '',
