@@ -33,6 +33,7 @@ USER node
 
 RUN mkdir -p "${OPENCLAW_STATE_DIR}" "${NPM_CONFIG_PREFIX}" \
   && curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method npm --version "${OPENCLAW_VERSION}" --no-onboard --no-prompt \
+  && npm install -g mcporter \
   && test -x "${NPM_CONFIG_PREFIX}/bin/openclaw"
 
 ENV PATH=${NPM_CONFIG_PREFIX}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

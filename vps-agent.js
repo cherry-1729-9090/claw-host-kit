@@ -32,6 +32,10 @@ const MEM0_PLUGIN_PACKAGE = '@mem0/openclaw-mem0';
 const MEM0_PLUGIN_KEY = 'openclaw-mem0';
 const MEM0_ENV_PLACEHOLDER = '${MEM0_API_KEY}';
 const MEM0_API_KEY = process.env.OPENCLAW_MEM0_API_KEY || process.env.MEM0_API_KEY || '';
+const COMPOSIO_SERVER_NAME = 'composio';
+const COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
+const COMPOSIO_HEADER_NAME = 'x-consumer-api-key';
+const COMPOSIO_API_KEY = process.env.OPENCLAW_COMPOSIO_API_KEY || '';
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -347,6 +351,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
         }
 
         const mem0 = await ensureMem0ForInstance(instanceId);
+        const composio = await ensureComposioForInstance(instanceId);
 
         const result = {
             ok: true,
@@ -354,6 +359,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             containerName: `openclaw-${instanceId}`,
             gatewayToken,
             mem0,
+            composio,
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
         };
@@ -477,6 +483,70 @@ function readInstanceConfig(instanceId) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     if (!fs.existsSync(configPath)) return null;
     try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
+}
+
+function listAgentWorkspaceDirs(instanceId) {
+    const agentsDir = path.join(INSTANCES_DIR, instanceId, 'agents');
+    if (!fs.existsSync(agentsDir)) return [];
+    return fs.readdirSync(agentsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(agentsDir, entry.name))
+        .filter((dir) => fs.existsSync(path.join(dir, 'AGENTS.md')) || fs.existsSync(path.join(dir, 'TOOLS.md')) || fs.existsSync(path.join(dir, '.openclaw')))
+        .sort();
+}
+
+function getComposioWorkspaceDirs(instanceId, extraDirs = []) {
+    const dirs = [
+        path.join(INSTANCES_DIR, instanceId, 'workspace'),
+        ...listAgentWorkspaceDirs(instanceId),
+        ...extraDirs,
+    ].filter(Boolean);
+    return Array.from(new Set(dirs));
+}
+
+function buildComposioServerConfig() {
+    return {
+        transport: 'http',
+        url: COMPOSIO_MCP_URL,
+        headers: {
+            [COMPOSIO_HEADER_NAME]: COMPOSIO_API_KEY,
+        },
+    };
+}
+
+function ensureComposioConfigAtWorkspace(workspaceDir) {
+    const configDir = path.join(workspaceDir, 'config');
+    const configPath = path.join(configDir, 'mcporter.json');
+    const existed = fs.existsSync(configPath);
+
+    fs.mkdirSync(configDir, { recursive: true });
+
+    let parsed = {};
+    try {
+        if (existed) {
+            parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+    } catch {
+        parsed = {};
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        parsed = {};
+    }
+    if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object' || Array.isArray(parsed.mcpServers)) {
+        parsed.mcpServers = {};
+    }
+
+    const nextServer = buildComposioServerConfig();
+    const previousServer = parsed.mcpServers[COMPOSIO_SERVER_NAME];
+    const changed = !existed || JSON.stringify(previousServer || null) !== JSON.stringify(nextServer);
+    parsed.mcpServers[COMPOSIO_SERVER_NAME] = nextServer;
+
+    if (changed) {
+        fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
+    }
+
+    return { changed, path: configPath };
 }
 
 function ensureMem0PluginConfig(config, instanceId) {
@@ -1212,6 +1282,13 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
             return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
         }
 
+        try {
+            const agentWorkspaceDir = path.join(INSTANCES_DIR, instanceId, 'agents', agentId);
+            await ensureComposioForInstance(instanceId, [agentWorkspaceDir]);
+        } catch (err) {
+            console.warn(`[vps-agent] composio setup skipped for ${instanceId}/${agentId}: ${err.message}`);
+        }
+
         // Step 2: Send the initial task message
         const chatResult = await gatewayWsExec(container, gatewayToken, 'chat.send', {
             sessionKey: `agent:${agentId}:${agentId}`,
@@ -1255,6 +1332,26 @@ async function ensurePython3InContainer(containerName) {
         console.log(`[vps-agent] installing python3 in ${containerName}`);
         await runDockerExecAsRoot(containerName, ['sh', '-lc', 'apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*']);
         return true;
+    }
+}
+
+async function ensureMcporterInContainer(containerName) {
+    let installedNow = false;
+    try {
+        await runDockerExecDirect(containerName, ['sh', '-lc', 'command -v mcporter >/dev/null 2>&1 || test -x /home/node/.npm-global/bin/mcporter']);
+    } catch {
+        console.log(`[vps-agent] installing mcporter in ${containerName}`);
+        await runDockerExecDirect(containerName, ['sh', '-lc', 'npm install -g mcporter']);
+        installedNow = true;
+    }
+
+    await runDockerExecAsRoot(containerName, ['sh', '-lc', 'if [ -x /home/node/.npm-global/bin/mcporter ] && [ ! -e /usr/local/bin/mcporter ]; then ln -sf /home/node/.npm-global/bin/mcporter /usr/local/bin/mcporter; fi']);
+
+    try {
+        await runDockerExecDirect(containerName, ['sh', '-lc', 'command -v mcporter >/dev/null 2>&1']);
+        return installedNow;
+    } catch {
+        throw new Error('mcporter is installed but not executable via PATH');
     }
 }
 
@@ -1312,6 +1409,54 @@ async function ensureMem0ForInstance(instanceId) {
         userId: instanceId,
     };
 }
+
+async function ensureComposioForInstance(instanceId, extraWorkspaceDirs = []) {
+    if (!validId(instanceId)) {
+        throw new Error('Invalid instanceId');
+    }
+    if (!COMPOSIO_API_KEY) {
+        return {
+            ok: false,
+            skipped: true,
+            reason: 'OPENCLAW_COMPOSIO_API_KEY is not configured on the host',
+        };
+    }
+
+    const containerName = `openclaw-${instanceId}`;
+    const config = readInstanceConfig(instanceId);
+    if (!config) {
+        throw new Error('Config not found');
+    }
+
+    const installedNow = await ensureMcporterInContainer(containerName);
+    const workspaceDirs = getComposioWorkspaceDirs(instanceId, extraWorkspaceDirs);
+    const writes = workspaceDirs.map((workspaceDir) => ensureComposioConfigAtWorkspace(workspaceDir));
+    const changedPaths = writes.filter((entry) => entry.changed).map((entry) => entry.path);
+
+    return {
+        ok: true,
+        installed: true,
+        installedNow,
+        configChanged: changedPaths.length > 0,
+        server: COMPOSIO_SERVER_NAME,
+        workspaces: workspaceDirs,
+        changedPaths,
+    };
+}
+
+app.post('/api/internal/composio-ensure', requireInternal, async (req, res) => {
+    const { instanceId } = req.body;
+    if (!instanceId) {
+        return res.status(400).json({ error: 'instanceId is required' });
+    }
+    try {
+        const result = await ensureComposioForInstance(instanceId);
+        res.json(result);
+    } catch (err) {
+        console.error(`[vps-agent] composio-ensure failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
     const { instanceId, channel, token, slackBotToken, slackAppToken } = req.body;
