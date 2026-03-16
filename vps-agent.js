@@ -1416,17 +1416,64 @@ function getComposioWorkspaceDirs(instanceId, extraDirs = []) {
     return Array.from(new Set(dirs));
 }
 
-function buildComposioServerConfig() {
-    return {
-        transport: 'http',
-        url: COMPOSIO_MCP_URL,
-        headers: {
+function buildComposioServerConfig(overrides = {}) {
+    const nextUrl = typeof overrides.url === 'string' && overrides.url.trim()
+        ? overrides.url.trim()
+        : COMPOSIO_MCP_URL;
+    const nextHeaders = overrides.headers && typeof overrides.headers === 'object' && !Array.isArray(overrides.headers)
+        ? Object.fromEntries(Object.entries(overrides.headers).filter(([key, value]) => key && value !== undefined && value !== null && String(value).trim() !== ''))
+        : {
             [COMPOSIO_HEADER_NAME]: COMPOSIO_API_KEY,
-        },
+        };
+    const transport = String(overrides.transport || 'http').trim() || 'http';
+
+    return {
+        transport,
+        url: nextUrl,
+        headers: nextHeaders,
     };
 }
 
-function ensureComposioConfigAtWorkspace(workspaceDir) {
+function readComposioServerConfigAtWorkspace(workspaceDir) {
+    const configPath = path.join(workspaceDir, 'config', 'mcporter.json');
+    if (!fs.existsSync(configPath)) return null;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const server = parsed?.mcpServers?.[COMPOSIO_SERVER_NAME];
+        if (!server || typeof server !== 'object') return null;
+        return {
+            transport: String(server.transport || 'http').trim() || 'http',
+            url: String(server.url || '').trim(),
+            headers: server.headers && typeof server.headers === 'object' && !Array.isArray(server.headers)
+                ? Object.fromEntries(Object.entries(server.headers).filter(([key, value]) => key && value !== undefined && value !== null && String(value).trim() !== ''))
+                : {},
+        };
+    } catch {
+        return null;
+    }
+}
+
+function resolveComposioServerConfig(instanceId, overrides = {}) {
+    const explicit = buildComposioServerConfig(overrides);
+    if (explicit.url && explicit.headers && Object.keys(explicit.headers).length > 0 && (overrides.url || overrides.headers)) {
+        return explicit;
+    }
+
+    const existingCandidates = [
+        path.join(INSTANCES_DIR, instanceId, 'workspace'),
+        ...listAgentWorkspaceDirs(instanceId),
+    ];
+    for (const workspaceDir of existingCandidates) {
+        const existing = readComposioServerConfigAtWorkspace(workspaceDir);
+        if (existing?.url && existing.headers && Object.keys(existing.headers).length > 0) {
+            return existing;
+        }
+    }
+
+    return explicit;
+}
+
+function ensureComposioConfigAtWorkspace(workspaceDir, serverConfig) {
     const configDir = path.join(workspaceDir, 'config');
     const configPath = path.join(configDir, 'mcporter.json');
     const existed = fs.existsSync(configPath);
@@ -1449,7 +1496,7 @@ function ensureComposioConfigAtWorkspace(workspaceDir) {
         parsed.mcpServers = {};
     }
 
-    const nextServer = buildComposioServerConfig();
+    const nextServer = buildComposioServerConfig(serverConfig);
     const previousServer = parsed.mcpServers[COMPOSIO_SERVER_NAME];
     const changed = !existed || JSON.stringify(previousServer || null) !== JSON.stringify(nextServer);
     parsed.mcpServers[COMPOSIO_SERVER_NAME] = nextServer;
@@ -3532,15 +3579,17 @@ async function ensureMem0ForInstance(instanceId) {
     };
 }
 
-async function ensureComposioForInstance(instanceId, extraWorkspaceDirs = []) {
+async function ensureComposioForInstance(instanceId, extraWorkspaceDirs = [], serverConfigOverrides = {}) {
     if (!validId(instanceId)) {
         throw new Error('Invalid instanceId');
     }
-    if (!COMPOSIO_API_KEY) {
+    const nextServer = resolveComposioServerConfig(instanceId, serverConfigOverrides);
+    const hasHeaders = nextServer.headers && Object.keys(nextServer.headers).length > 0;
+    if (!hasHeaders) {
         return {
             ok: false,
             skipped: true,
-            reason: 'OPENCLAW_COMPOSIO_API_KEY is not configured on the host',
+            reason: 'Composio MCP session headers are not configured',
         };
     }
 
@@ -3552,7 +3601,7 @@ async function ensureComposioForInstance(instanceId, extraWorkspaceDirs = []) {
 
     const installedNow = await ensureMcporterInContainer(containerName);
     const workspaceDirs = getComposioWorkspaceDirs(instanceId, extraWorkspaceDirs);
-    const writes = workspaceDirs.map((workspaceDir) => ensureComposioConfigAtWorkspace(workspaceDir));
+    const writes = workspaceDirs.map((workspaceDir) => ensureComposioConfigAtWorkspace(workspaceDir, nextServer));
     const changedPaths = writes.filter((entry) => entry.changed).map((entry) => entry.path);
 
     return {
@@ -3563,6 +3612,7 @@ async function ensureComposioForInstance(instanceId, extraWorkspaceDirs = []) {
         server: COMPOSIO_SERVER_NAME,
         workspaces: workspaceDirs,
         changedPaths,
+        serverConfig: nextServer,
     };
 }
 
@@ -3576,6 +3626,24 @@ app.post('/api/internal/composio-ensure', requireInternal, async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error(`[vps-agent] composio-ensure failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/internal/composio-configure-session', requireInternal, async (req, res) => {
+    const { instanceId, mcp } = req.body || {};
+    if (!instanceId) {
+        return res.status(400).json({ error: 'instanceId is required' });
+    }
+    if (!mcp || typeof mcp !== 'object') {
+        return res.status(400).json({ error: 'mcp config is required' });
+    }
+
+    try {
+        const result = await ensureComposioForInstance(instanceId, [], mcp);
+        res.json(result);
+    } catch (err) {
+        console.error(`[vps-agent] composio-configure-session failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
     }
 });
