@@ -872,8 +872,7 @@ function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
             reason: topSpecialist.reasons[0] || 'A specialist is a better fit than keeping the task on the manager.'
         };
     }
-    const requiresStrictConnection = requirements.highRiskActions.length > 0
-        || requirements.requiredApps.some((app) => STRICT_CONNECTION_APPS.has(app));
+    const requiresStrictConnection = taskRequiresStrictConnection(requirements);
 
     if (requiresStrictConnection && requirements.needsExternalAction && missingRequiredApp) {
         return {
@@ -888,6 +887,11 @@ function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
         ranked,
         reason: top.reasons[0] || 'Best capability match in the current team.'
     };
+}
+
+function taskRequiresStrictConnection(requirements) {
+    return requirements.highRiskActions.length > 0
+        || requirements.requiredApps.some((app) => STRICT_CONNECTION_APPS.has(app));
 }
 
 function parseManagerDecision(text) {
@@ -1094,6 +1098,16 @@ async function executeTaskRecord(instanceId, taskRecord) {
             managerDecision.agentId = heuristicDecision.assignee.id;
             managerDecision.reason = `Main kept routing authority, but ${heuristicDecision.assignee.id} is the stronger specialist match. ${managerDecision.reason || heuristicDecision.reason}`;
             managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control overrode a manager self-assignment in favor of a specialist.'];
+        }
+
+        if (managerDecision.decision !== 'assign'
+            && heuristicDecision.assignee
+            && !taskRequiresStrictConnection(requirements)) {
+            const previousDecision = managerDecision.decision;
+            managerDecision.decision = 'assign';
+            managerDecision.agentId = heuristicDecision.assignee.id;
+            managerDecision.reason = `Manager marked the task as ${previousDecision}, but ${heuristicDecision.assignee.id} is a credible specialist match. ${heuristicDecision.reason}`;
+            managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control overrode a non-assignment because a specialist match was available.'];
         }
 
         if (managerDecision.decision === 'assign' && !managerDecision.agentId) {
