@@ -705,6 +705,8 @@ const HIGH_RISK_ACTION_RULES = [
     { tag: 'delete', keywords: ['delete', 'remove permanently', 'destroy'] },
 ];
 
+const STRICT_CONNECTION_APPS = new Set(['gmail', 'slack', 'calendar']);
+
 function inferTagsFromText(text, rules) {
     const haystack = String(text || '').toLowerCase();
     return rules
@@ -870,7 +872,10 @@ function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
             reason: topSpecialist.reasons[0] || 'A specialist is a better fit than keeping the task on the manager.'
         };
     }
-    if (requirements.needsExternalAction && missingRequiredApp) {
+    const requiresStrictConnection = requirements.highRiskActions.length > 0
+        || requirements.requiredApps.some((app) => STRICT_CONNECTION_APPS.has(app));
+
+    if (requiresStrictConnection && requirements.needsExternalAction && missingRequiredApp) {
         return {
             assignee: null,
             ranked,
@@ -2758,7 +2763,7 @@ app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
         agentId: MANAGER_AGENT_ID,
         assignedAgentId: '',
         managerAgentId: MANAGER_AGENT_ID,
-        requestedAgentId: String(agentId || '').trim(),
+        requestedAgentId: String(agentId || '').trim() === MANAGER_AGENT_ID ? '' : String(agentId || '').trim(),
         priority: Number(priority) || 3,
         status: 'triage',
         createdAt: now,
