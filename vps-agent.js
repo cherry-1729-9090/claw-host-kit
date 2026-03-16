@@ -558,6 +558,35 @@ function normalizeModelOverride(modelValue, defaultsModel = {}) {
     };
 }
 
+function buildConfigBackedModels(config) {
+    const defaults = config?.agents?.defaults || {};
+    const allowedModels = new Set(Object.keys(defaults.models || {}));
+    const primary = normalizeModelOverride(defaults.model || {}, defaults.model || {}).primary;
+    if (primary) allowedModels.add(primary);
+
+    const providers = config?.models?.providers || {};
+
+    return Array.from(allowedModels)
+        .filter(Boolean)
+        .map((key) => {
+            const [providerKey, ...restParts] = String(key).split('/');
+            const rawId = restParts.join('/');
+            const provider = providers?.[providerKey];
+            const providerModels = Array.isArray(provider?.models) ? provider.models : [];
+            const matched = providerModels.find((entry) => {
+                const entryId = String(entry?.id || '');
+                return entryId === key || entryId === rawId;
+            });
+
+            return {
+                key,
+                id: rawId || key,
+                provider: providerKey || '',
+                name: matched?.name || rawId || key
+            };
+        });
+}
+
 function listAgentWorkspaceDirs(instanceId) {
     const agentsDir = path.join(INSTANCES_DIR, instanceId, 'agents');
     if (!fs.existsSync(agentsDir)) return [];
@@ -1405,14 +1434,30 @@ app.post('/api/internal/models-list', requireInternal, async (req, res) => {
     const config = readInstanceConfig(instanceId);
     if (!config) return res.status(404).json({ error: 'Config not found' });
     const gatewayToken = config.gateway?.auth?.token;
-    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+    const configBackedModels = buildConfigBackedModels(config);
+    if (!gatewayToken) return res.json({ models: configBackedModels });
 
     try {
         const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'models.list', {});
-        res.json(result?.payload || result);
+        if (result?.ok === false) {
+            console.warn(`[vps-agent] models-list gateway fallback for ${instanceId}: ${result?.error?.message || 'unknown error'}`);
+            return res.json({ models: configBackedModels, warning: result?.error?.message || 'gateway models.list failed' });
+        }
+
+        const payload = result?.payload || result;
+        const models = Array.isArray(payload?.models)
+            ? payload.models
+            : Array.isArray(payload)
+                ? payload
+                : [];
+        if (models.length) {
+            return res.json({ models });
+        }
+
+        return res.json({ models: configBackedModels });
     } catch (err) {
         console.error(`[vps-agent] models-list failed for ${instanceId}:`, err.message);
-        res.status(500).json({ error: err.message });
+        res.json({ models: configBackedModels, warning: err.message });
     }
 });
 
