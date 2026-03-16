@@ -362,6 +362,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
         const defaultModel = await ensureDefaultModelForInstance(instanceId);
         const managerConfig = readInstanceConfig(instanceId);
         if (managerConfig) {
+            removeBootstrapFilesForInstance(instanceId, managerConfig);
             ensureManagerProfileForInstance(instanceId, managerConfig, { force: false });
             writeInstanceConfig(instanceId, managerConfig);
         }
@@ -517,6 +518,25 @@ function getAgentWorkspacePath(instanceId, agentId) {
 
 function ensureDirSync(dirPath) {
     fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function removeBootstrapFiles(workspacePath) {
+    for (const name of ['BOOTSTRAP.md', 'bootstrap.md']) {
+        const filePath = path.join(workspacePath, name);
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath, { force: true });
+        }
+    }
+}
+
+function removeBootstrapFilesForInstance(instanceId, config = null) {
+    const resolvedConfig = config || readInstanceConfig(instanceId) || {};
+    removeBootstrapFiles(getMainWorkspace(instanceId));
+    const agents = Array.isArray(resolvedConfig?.agents?.list) ? resolvedConfig.agents.list : [];
+    for (const agent of agents) {
+        if (!agent?.id || agent.id === MANAGER_AGENT_ID) continue;
+        removeBootstrapFiles(getAgentWorkspacePath(instanceId, agent.id));
+    }
 }
 
 function normalizeTagList(values = []) {
@@ -954,6 +974,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
     const startedAt = new Date().toISOString();
     let workingTask = { ...taskRecord };
     const config = readInstanceConfig(instanceId) || {};
+    removeBootstrapFilesForInstance(instanceId, config);
     ensureManagerProfileForInstance(instanceId, config, { force: false });
     const roster = buildAgentRoster(instanceId, config);
     const requirements = inferTaskRequirements(taskRecord.message);
@@ -3009,6 +3030,7 @@ function buildSpecialistProfile({ agentId, label, identityMd, soulMd, agentsMd }
 function ensureManagerProfileForInstance(instanceId, config, { force = false } = {}) {
     const workspace = getMainWorkspace(instanceId);
     ensureDirSync(workspace);
+    removeBootstrapFiles(workspace);
     const manager = buildManagerProfile();
     const identityPath = path.join(workspace, 'IDENTITY.md');
     const soulPath = path.join(workspace, 'SOUL.md');
@@ -3145,6 +3167,7 @@ function ensureAgentWorkspaceOnDisk(instanceId, agentId) {
 
     fs.mkdirSync(path.dirname(targetWorkspace), { recursive: true });
     fs.cpSync(sourceWorkspace, targetWorkspace, { recursive: true, force: false, errorOnExist: true });
+    removeBootstrapFiles(targetWorkspace);
 
     const targetAgentDir = path.join(targetWorkspace, 'agent');
     const targetSessionsDir = path.join(targetWorkspace, 'sessions');
