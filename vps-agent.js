@@ -492,6 +492,47 @@ function readInstanceConfig(instanceId) {
     try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
 }
 
+function sanitizeAllowedModelsMap(models) {
+    if (!models || typeof models !== 'object' || Array.isArray(models)) {
+        return { models: {}, changed: !!models };
+    }
+
+    const nextModels = {};
+    let changed = false;
+
+    for (const [modelId, rawValue] of Object.entries(models)) {
+        if (!rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) {
+            nextModels[modelId] = {};
+            changed = true;
+            continue;
+        }
+
+        const { enabled, ...rest } = rawValue;
+        if (enabled !== undefined) changed = true;
+        nextModels[modelId] = rest;
+    }
+
+    return { models: nextModels, changed };
+}
+
+function sanitizeInstanceConfig(config) {
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        return { config, changed: false };
+    }
+
+    let changed = false;
+    const defaults = config.agents?.defaults;
+    if (defaults && defaults.models) {
+        const sanitized = sanitizeAllowedModelsMap(defaults.models);
+        if (sanitized.changed) {
+            defaults.models = sanitized.models;
+            changed = true;
+        }
+    }
+
+    return { config, changed };
+}
+
 function listAgentWorkspaceDirs(instanceId) {
     const agentsDir = path.join(INSTANCES_DIR, instanceId, 'agents');
     if (!fs.existsSync(agentsDir)) return [];
@@ -943,7 +984,7 @@ function upsertAllowedModel(config, modelId) {
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
     config.agents.defaults.models = config.agents.defaults.models || {};
-    config.agents.defaults.models[modelId] = { enabled: true };
+    config.agents.defaults.models[modelId] = {};
 }
 
 async function ensureDefaultModelForInstance(instanceId, { force = true } = {}) {
@@ -1677,7 +1718,8 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
 
 function writeInstanceConfig(instanceId, config) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+    const { config: sanitizedConfig } = sanitizeInstanceConfig(config);
+    fs.writeFileSync(configPath, JSON.stringify(sanitizedConfig, null, 2), 'utf8');
 }
 
 function getAgentContainerWorkspace(agentId) {
