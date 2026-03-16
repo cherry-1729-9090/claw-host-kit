@@ -585,6 +585,31 @@ function extractMissionControlProfile(markdown) {
     }
 }
 
+function extractBulletValues(markdown, heading) {
+    const text = String(markdown || '');
+    const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = text.match(new RegExp(`^##\\s+${escapedHeading}\\s*$([\\s\\S]*?)(?=^##\\s+|$)`, 'im'));
+    if (!match) return [];
+    return match[1]
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('- '))
+        .map((line) => line.slice(2).trim())
+        .filter(Boolean);
+}
+
+function extractInlineProfileValues(markdown, label) {
+    const text = String(markdown || '');
+    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`^[-*]\\s+${escapedLabel}:\\s*(.+)$`, 'gim');
+    const values = [];
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+        values.push(...match[1].split(',').map((value) => value.trim()).filter(Boolean));
+    }
+    return values;
+}
+
 function renderMissionControlProfile(profile) {
     return [
         '<!-- mission-control-profile',
@@ -675,13 +700,22 @@ function inferAgentProfile(agent) {
         agent?.files?.agentsMd,
     ].join('\n');
     const embedded = extractMissionControlProfile(agent?.files?.agentsMd);
+    const inlineCapabilities = normalizeTagList([
+        ...extractInlineProfileValues(agent?.files?.agentsMd, 'Capabilities'),
+        ...extractBulletValues(agent?.files?.agentsMd, 'Capabilities')
+    ]);
+    const inlineToolkits = normalizeTagList([
+        ...extractInlineProfileValues(agent?.files?.agentsMd, 'Tools / apps'),
+        ...extractInlineProfileValues(agent?.files?.agentsMd, 'Tools/apps'),
+        ...extractBulletValues(agent?.files?.agentsMd, 'Tools / Apps')
+    ]);
     const inferredCapabilities = inferTagsFromText(combined, CAPABILITY_RULES);
     const inferredToolkits = inferTagsFromText(combined, TOOLKIT_RULES);
-    const inferredTaskTypes = normalizeTagList([...inferredCapabilities, ...inferredToolkits]);
+    const inferredTaskTypes = normalizeTagList([...inlineCapabilities, ...inlineToolkits, ...inferredCapabilities, ...inferredToolkits]);
     const profile = {
         role: embedded?.role || (agent?.id === MANAGER_AGENT_ID ? 'manager' : inferredCapabilities[0] || 'generalist'),
-        capabilities: normalizeTagList([...(embedded?.capabilities || []), ...inferredCapabilities]),
-        toolkits: normalizeTagList([...(embedded?.toolkits || []), ...inferredToolkits]),
+        capabilities: normalizeTagList([...(embedded?.capabilities || []), ...inlineCapabilities, ...inferredCapabilities]),
+        toolkits: normalizeTagList([...(embedded?.toolkits || []), ...inlineToolkits, ...inferredToolkits]),
         taskTypes: normalizeTagList([...(embedded?.taskTypes || []), ...inferredTaskTypes]),
         connectedApps: normalizeTagList(embedded?.connectedApps || []),
         responsibilities: normalizeObjectList(embedded?.responsibilities || []),
@@ -796,6 +830,10 @@ function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
     const top = ranked[0] || null;
     const topToolkitSet = new Set([...(top?.agent?.profile?.toolkits || []), ...(top?.agent?.profile?.connectedApps || [])]);
     const missingRequiredApp = requirements.requiredApps.some((app) => !topToolkitSet.has(app));
+    const rankedSpecialists = ranked.filter((entry) => entry.agent?.id !== MANAGER_AGENT_ID);
+    const topSpecialist = rankedSpecialists[0] || null;
+    const specialistToolkitSet = new Set([...(topSpecialist?.agent?.profile?.toolkits || []), ...(topSpecialist?.agent?.profile?.connectedApps || [])]);
+    const specialistMissingRequiredApp = requirements.requiredApps.some((app) => !specialistToolkitSet.has(app));
     if (!top || top.score < 3) {
         return {
             assignee: null,
@@ -803,6 +841,13 @@ function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
             reason: requirements.needsExternalAction
                 ? 'No agent currently advertises the toolkit or trust level needed for this external action.'
                 : 'No specialist in the current team clearly matches this task.'
+        };
+    }
+    if (top.agent?.id === MANAGER_AGENT_ID && topSpecialist && topSpecialist.score >= 3 && (!requirements.needsExternalAction || !specialistMissingRequiredApp)) {
+        return {
+            assignee: topSpecialist.agent,
+            ranked,
+            reason: topSpecialist.reasons[0] || 'A specialist is a better fit than keeping the task on the manager.'
         };
     }
     if (requirements.needsExternalAction && missingRequiredApp) {
@@ -920,7 +965,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
         'Return ONLY valid JSON with this exact shape:',
         '{"decision":"assign|blocked|awaiting_connection|awaiting_approval","agentId":"agent-id-or-empty","reason":"short explanation","requiredCapabilities":["capability"],"requiredApps":["toolkit"],"notes":["optional note"]}',
         'Rules:',
-        '- Prefer the best-fit specialist instead of always keeping work on main.',
+        '- Prefer the best-fit specialist instead of keeping work on main when a specialist is reasonably qualified.',
         '- If no one on the team is clearly suitable, return "blocked".',
         '- If the task needs an app connection or auth that is likely missing, return "awaiting_connection".',
         '- If the task needs human sign-off before sending/publishing/deleting, return "awaiting_approval".',
@@ -1014,6 +1059,15 @@ async function executeTaskRecord(instanceId, taskRecord) {
         const rosterAgentIds = new Set(roster.map((agent) => agent.id));
         if (managerDecision.agentId && !rosterAgentIds.has(managerDecision.agentId)) {
             managerDecision.agentId = '';
+        }
+
+        if (managerDecision.decision === 'assign'
+            && managerDecision.agentId === MANAGER_AGENT_ID
+            && heuristicDecision.assignee
+            && heuristicDecision.assignee.id !== MANAGER_AGENT_ID) {
+            managerDecision.agentId = heuristicDecision.assignee.id;
+            managerDecision.reason = `Main kept routing authority, but ${heuristicDecision.assignee.id} is the stronger specialist match. ${managerDecision.reason || heuristicDecision.reason}`;
+            managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control overrode a manager self-assignment in favor of a specialist.'];
         }
 
         if (managerDecision.decision === 'assign' && !managerDecision.agentId) {
