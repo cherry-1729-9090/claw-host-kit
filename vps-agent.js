@@ -41,6 +41,8 @@ const DEFAULT_PROVIDER_BASE_URL = process.env.OPENCLAW_DEFAULT_PROVIDER_BASE_URL
 const DEFAULT_PROVIDER_API_KEY = process.env.OPENCLAW_DEFAULT_PROVIDER_API_KEY || '';
 const DEFAULT_PROVIDER_API = process.env.OPENCLAW_DEFAULT_PROVIDER_API || 'openai-completions';
 const DEFAULT_PRIMARY_MODEL_RAW = process.env.OPENCLAW_DEFAULT_PRIMARY_MODEL || `${DEFAULT_PROVIDER_KEY}/workers-ai/@cf/nvidia/nemotron-3-120b-a12b`;
+const MANAGER_AGENT_ID = 'main';
+const MANAGER_IDENTITY_NAME = 'Mission Manager';
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -358,6 +360,11 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
         const mem0 = await ensureMem0ForInstance(instanceId);
         const composio = await ensureComposioForInstance(instanceId);
         const defaultModel = await ensureDefaultModelForInstance(instanceId);
+        const managerConfig = readInstanceConfig(instanceId);
+        if (managerConfig) {
+            ensureManagerProfileForInstance(instanceId, managerConfig, { force: false });
+            writeInstanceConfig(instanceId, managerConfig);
+        }
 
         const result = {
             ok: true,
@@ -367,6 +374,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             mem0,
             composio,
             defaultModel,
+            manager: { enabled: true, agentId: MANAGER_AGENT_ID, identity: MANAGER_IDENTITY_NAME },
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
             output: output.trim(),
         };
@@ -497,6 +505,94 @@ function getTasksStorePath(instanceId) {
     return path.join(INSTANCES_DIR, instanceId, TASKS_STORE_FILE);
 }
 
+function getMainWorkspace(instanceId) {
+    return path.join(INSTANCES_DIR, instanceId, 'workspace');
+}
+
+function getAgentWorkspacePath(instanceId, agentId) {
+    return agentId === MANAGER_AGENT_ID
+        ? getMainWorkspace(instanceId)
+        : getAgentHostWorkspace(instanceId, agentId);
+}
+
+function ensureDirSync(dirPath) {
+    fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function normalizeTagList(values = []) {
+    return Array.from(new Set(
+        (Array.isArray(values) ? values : [])
+            .map((value) => String(value || '').trim().toLowerCase())
+            .filter(Boolean)
+    ));
+}
+
+function normalizeObjectList(values = []) {
+    return Array.isArray(values)
+        ? values
+            .filter((value) => value && typeof value === 'object')
+            .map((value) => Object.fromEntries(
+                Object.entries(value).map(([key, entry]) => [key, typeof entry === 'string' ? entry.trim() : entry])
+            ))
+        : [];
+}
+
+function stripMarkdown(markdown) {
+    return String(markdown || '')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/!\[[^\]]*]\([^)]+\)/g, ' ')
+        .replace(/\[[^\]]+]\([^)]+\)/g, '$1')
+        .replace(/^>\s?/gm, '')
+        .replace(/^#+\s*/gm, '')
+        .replace(/[*_~]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function extractEmbeddedJson(text) {
+    const normalized = String(text || '').trim();
+    if (!normalized) return null;
+
+    const direct = extractJsonObject(normalized);
+    if (direct) return direct;
+
+    const fenceMatch = normalized.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenceMatch) {
+        const fromFence = extractJsonObject(fenceMatch[1]);
+        if (fromFence) return fromFence;
+    }
+
+    return null;
+}
+
+function extractMissionControlProfile(markdown) {
+    const match = String(markdown || '').match(/<!--\s*mission-control-profile\s*([\s\S]*?)-->/i);
+    if (!match) return null;
+    try {
+        const parsed = JSON.parse(match[1].trim());
+        return {
+            ...parsed,
+            capabilities: normalizeTagList(parsed?.capabilities),
+            toolkits: normalizeTagList(parsed?.toolkits),
+            taskTypes: normalizeTagList(parsed?.taskTypes),
+            connectedApps: normalizeTagList(parsed?.connectedApps),
+            responsibilities: normalizeObjectList(parsed?.responsibilities),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function renderMissionControlProfile(profile) {
+    return [
+        '<!-- mission-control-profile',
+        JSON.stringify(profile, null, 2),
+        '-->'
+    ].join('\n');
+}
+
 function readTasksStore(instanceId) {
     const storePath = getTasksStorePath(instanceId);
     if (!fs.existsSync(storePath)) return [];
@@ -537,6 +633,238 @@ function extractJsonObject(rawOutput) {
     return null;
 }
 
+const CAPABILITY_RULES = [
+    { tag: 'triage', keywords: ['triage', 'route', 'assign', 'delegate', 'manager', 'coordinate', 'coordination', 'orchestrate'] },
+    { tag: 'research', keywords: ['research', 'investigate', 'analyze', 'analysis', 'deep dive', 'compare', 'internet', 'web'] },
+    { tag: 'writing', keywords: ['write', 'writer', 'draft', 'copy', 'content', 'article', 'blog', 'summarize', 'summary'] },
+    { tag: 'email', keywords: ['email', 'mail', 'outreach', 'reply', 'inbox'] },
+    { tag: 'communication', keywords: ['communication', 'message', 'comment', 'respond', 'customer', 'support'] },
+    { tag: 'coding', keywords: ['code', 'implement', 'debug', 'fix', 'refactor', 'api', 'backend', 'frontend', 'javascript', 'react'] },
+    { tag: 'design', keywords: ['design', 'ui', 'ux', 'figma', 'layout', 'visual'] },
+    { tag: 'docs', keywords: ['docs', 'documentation', 'readme', 'spec', 'proposal', 'brief'] },
+    { tag: 'operations', keywords: ['deploy', 'deployment', 'infra', 'ops', 'server', 'docker', 'monitor', 'provision'] },
+    { tag: 'planning', keywords: ['plan', 'roadmap', 'strategy', 'prioritize', 'decision'] },
+];
+
+const TOOLKIT_RULES = [
+    { tag: 'gmail', keywords: ['gmail', 'email', 'mail'] },
+    { tag: 'slack', keywords: ['slack'] },
+    { tag: 'github', keywords: ['github', 'pull request', 'issue'] },
+    { tag: 'notion', keywords: ['notion'] },
+    { tag: 'calendar', keywords: ['calendar', 'meeting'] },
+];
+
+const HIGH_RISK_ACTION_RULES = [
+    { tag: 'send_email', keywords: ['send an email', 'write a mail', 'send mail', 'email ', 'gmail'] },
+    { tag: 'publish', keywords: ['publish', 'post publicly', 'send to client', 'ship it live'] },
+    { tag: 'delete', keywords: ['delete', 'remove permanently', 'destroy'] },
+];
+
+function inferTagsFromText(text, rules) {
+    const haystack = String(text || '').toLowerCase();
+    return rules
+        .filter((rule) => rule.keywords.some((keyword) => haystack.includes(keyword)))
+        .map((rule) => rule.tag);
+}
+
+function inferAgentProfile(agent) {
+    const combined = [
+        agent?.label,
+        agent?.files?.identityMd,
+        agent?.files?.soulMd,
+        agent?.files?.agentsMd,
+    ].join('\n');
+    const embedded = extractMissionControlProfile(agent?.files?.agentsMd);
+    const inferredCapabilities = inferTagsFromText(combined, CAPABILITY_RULES);
+    const inferredToolkits = inferTagsFromText(combined, TOOLKIT_RULES);
+    const inferredTaskTypes = normalizeTagList([...inferredCapabilities, ...inferredToolkits]);
+    const profile = {
+        role: embedded?.role || (agent?.id === MANAGER_AGENT_ID ? 'manager' : inferredCapabilities[0] || 'generalist'),
+        capabilities: normalizeTagList([...(embedded?.capabilities || []), ...inferredCapabilities]),
+        toolkits: normalizeTagList([...(embedded?.toolkits || []), ...inferredToolkits]),
+        taskTypes: normalizeTagList([...(embedded?.taskTypes || []), ...inferredTaskTypes]),
+        connectedApps: normalizeTagList(embedded?.connectedApps || []),
+        responsibilities: normalizeObjectList(embedded?.responsibilities || []),
+        canTakeExternalAction: Boolean(embedded?.canTakeExternalAction) || inferredToolkits.includes('gmail') || inferredCapabilities.includes('email'),
+        summary: embedded?.summary || stripMarkdown(combined).slice(0, 320),
+    };
+
+    if (agent?.id === MANAGER_AGENT_ID) {
+        profile.capabilities = normalizeTagList(['triage', 'planning', 'coordination', 'review', 'research', 'writing', ...profile.capabilities]);
+        profile.taskTypes = normalizeTagList(['triage', 'planning', 'research', 'writing', ...profile.taskTypes]);
+    }
+
+    return profile;
+}
+
+function inferTaskRequirements(message) {
+    const raw = String(message || '').trim();
+    const lower = raw.toLowerCase();
+    const capabilities = normalizeTagList(inferTagsFromText(lower, CAPABILITY_RULES));
+    const requiredApps = normalizeTagList(inferTagsFromText(lower, TOOLKIT_RULES));
+    const highRiskActions = normalizeTagList(inferTagsFromText(lower, HIGH_RISK_ACTION_RULES));
+    const needsExternalAction = requiredApps.length > 0 || highRiskActions.length > 0;
+
+    if (needsExternalAction && !capabilities.includes('communication')) capabilities.push('communication');
+    if (requiredApps.includes('gmail') && !capabilities.includes('email')) capabilities.push('email');
+    if (/research|investigate|find|internet|reddit|blog|article/.test(lower) && !capabilities.includes('research')) capabilities.push('research');
+    if (/write|draft|proposal|summary|mail|email/.test(lower) && !capabilities.includes('writing')) capabilities.push('writing');
+
+    return {
+        summary: raw.slice(0, 240),
+        capabilities,
+        requiredApps,
+        highRiskActions,
+        needsExternalAction,
+        needsApproval: highRiskActions.some((action) => action === 'publish' || action === 'delete' || action === 'send_email'),
+    };
+}
+
+function buildAgentRoster(instanceId, config) {
+    const configuredAgents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
+    const defaultsModel = config?.agents?.defaults?.model || {};
+    const rosterMap = new Map();
+
+    const allAgents = configuredAgents.some((agent) => agent?.id === MANAGER_AGENT_ID)
+        ? configuredAgents
+        : [{ id: MANAGER_AGENT_ID, name: MANAGER_IDENTITY_NAME }, ...configuredAgents];
+
+    for (const entry of allAgents) {
+        if (!entry?.id) continue;
+        const files = readAgentProfile(instanceId, entry.id).files;
+        const model = normalizeModelOverride(entry.model, defaultsModel);
+        const profile = inferAgentProfile({
+            id: entry.id,
+            label: entry.name || entry.id,
+            files
+        });
+        rosterMap.set(entry.id, {
+            id: entry.id,
+            label: entry.name || entry.id,
+            model: model.primary,
+            fallbacks: model.fallbacks,
+            files,
+            profile
+        });
+    }
+
+    return Array.from(rosterMap.values());
+}
+
+function scoreAgentForTask(agent, requirements, preferredAgentId) {
+    const capabilitySet = new Set(agent.profile.capabilities || []);
+    const toolkitSet = new Set([...(agent.profile.toolkits || []), ...(agent.profile.connectedApps || [])]);
+    let score = 0;
+    const reasons = [];
+
+    for (const capability of requirements.capabilities) {
+        if (capabilitySet.has(capability)) {
+            score += 4;
+            reasons.push(`matches capability "${capability}"`);
+        }
+    }
+
+    for (const app of requirements.requiredApps) {
+        if (toolkitSet.has(app)) {
+            score += 5;
+            reasons.push(`has toolkit "${app}"`);
+        }
+    }
+
+    if (preferredAgentId && agent.id === preferredAgentId) {
+        score += 3;
+        reasons.push('requested explicitly');
+    }
+
+    if (agent.id === MANAGER_AGENT_ID) {
+        score -= 1;
+        reasons.push('kept slightly behind specialists to preserve manager capacity');
+    }
+
+    if (requirements.needsExternalAction && !agent.profile.canTakeExternalAction) {
+        score -= 4;
+    }
+
+    return { score, reasons };
+}
+
+function chooseHeuristicAssignee(roster, requirements, preferredAgentId) {
+    const ranked = roster
+        .map((agent) => ({ agent, ...scoreAgentForTask(agent, requirements, preferredAgentId) }))
+        .sort((left, right) => right.score - left.score);
+
+    const top = ranked[0] || null;
+    const topToolkitSet = new Set([...(top?.agent?.profile?.toolkits || []), ...(top?.agent?.profile?.connectedApps || [])]);
+    const missingRequiredApp = requirements.requiredApps.some((app) => !topToolkitSet.has(app));
+    if (!top || top.score < 3) {
+        return {
+            assignee: null,
+            ranked,
+            reason: requirements.needsExternalAction
+                ? 'No agent currently advertises the toolkit or trust level needed for this external action.'
+                : 'No specialist in the current team clearly matches this task.'
+        };
+    }
+    if (requirements.needsExternalAction && missingRequiredApp) {
+        return {
+            assignee: null,
+            ranked,
+            reason: 'No agent currently advertises the required connected app for this task.'
+        };
+    }
+
+    return {
+        assignee: top.agent,
+        ranked,
+        reason: top.reasons[0] || 'Best capability match in the current team.'
+    };
+}
+
+function parseManagerDecision(text) {
+    const parsed = extractEmbeddedJson(text);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+        decision: String(parsed.decision || '').trim().toLowerCase(),
+        agentId: String(parsed.agentId || '').trim(),
+        reason: String(parsed.reason || '').trim(),
+        requiredCapabilities: normalizeTagList(parsed.requiredCapabilities || []),
+        requiredApps: normalizeTagList(parsed.requiredApps || []),
+        notes: Array.isArray(parsed.notes) ? parsed.notes.map((value) => String(value || '').trim()).filter(Boolean) : [],
+    };
+}
+
+function parseTaskOutcome(text) {
+    const parsed = extractEmbeddedJson(text);
+    if (parsed && typeof parsed === 'object') {
+        return {
+            status: String(parsed.status || '').trim().toLowerCase(),
+            summary: String(parsed.summary || '').trim(),
+            needs: Array.isArray(parsed.needs) ? parsed.needs.map((value) => String(value || '').trim()).filter(Boolean) : [],
+            evidence: Array.isArray(parsed.evidence) ? parsed.evidence.map((value) => String(value || '').trim()).filter(Boolean) : [],
+            followUps: Array.isArray(parsed.followUps) ? parsed.followUps.map((value) => String(value || '').trim()).filter(Boolean) : [],
+        };
+    }
+
+    const normalized = String(text || '').toLowerCase();
+    if (/connect|authorize|not connected|missing account|authentication/.test(normalized)) {
+        return { status: 'awaiting_connection', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+    }
+    if (/approve|approval|review before send|draft ready|ready for review/.test(normalized)) {
+        return { status: 'awaiting_approval', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+    }
+    if (/unable|cannot|can't|blocked|no suitable/.test(normalized)) {
+        return { status: 'blocked', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+    }
+
+    return {
+        status: 'completed',
+        summary: String(text || '').trim(),
+        needs: [],
+        evidence: [],
+        followUps: []
+    };
+}
+
 function mapStoredTaskToJob(task, options = {}) {
     const { includeNarrative = false, includeLog = false } = options;
     const narrative = Array.isArray(task?.narrative) ? task.narrative : [];
@@ -545,12 +873,18 @@ function mapStoredTaskToJob(task, options = {}) {
     const metadata = {
         status: task?.status || 'assigned',
         agentId: task?.agentId || 'main',
+        managerAgentId: task?.managerAgentId || MANAGER_AGENT_ID,
+        assignedAgentId: task?.assignedAgentId || task?.agentId || MANAGER_AGENT_ID,
+        requestedAgentId: task?.requestedAgentId || '',
         priority: Number(task?.priority) || 3,
         createdAt: task?.createdAt || null,
         updatedAt: task?.updatedAt || null,
         message: task?.message || '',
         channel: 'mission-control',
-        lastRun: task?.lastRun || null
+        lastRun: task?.lastRun || null,
+        requiredCapabilities: normalizeTagList(task?.requiredCapabilities || []),
+        requiredApps: normalizeTagList(task?.requiredApps || []),
+        manager: task?.manager || null
     };
 
     if (includeNarrative) metadata.narrative = narrative;
@@ -561,7 +895,7 @@ function mapStoredTaskToJob(task, options = {}) {
         id: task.id,
         name: task.name || task.id,
         status: task.status || 'assigned',
-        agentId: task.agentId || 'main',
+        agentId: task.assignedAgentId || task.agentId || MANAGER_AGENT_ID,
         model: task.model || '',
         payload: {
             message: task.message || ''
@@ -573,55 +907,283 @@ function mapStoredTaskToJob(task, options = {}) {
 async function executeTaskRecord(instanceId, taskRecord) {
     const containerName = `openclaw-${instanceId}`;
     const startedAt = new Date().toISOString();
-    upsertTaskRecord(instanceId, {
-        ...taskRecord,
-        status: 'picked_up',
-        updatedAt: startedAt,
-        log: [...(taskRecord.log || []), { ts: startedAt, role: 'system', text: 'Task picked up by agent runtime' }]
-    });
+    let workingTask = { ...taskRecord };
+    const config = readInstanceConfig(instanceId) || {};
+    ensureManagerProfileForInstance(instanceId, config, { force: false });
+    const roster = buildAgentRoster(instanceId, config);
+    const requirements = inferTaskRequirements(taskRecord.message);
+    const preferredAgentId = String(taskRecord.requestedAgentId || '').trim();
 
-    try {
+    const managerPrompt = [
+        'You are the Mission Control manager agent.',
+        'Decide who should own the task from the current team.',
+        'Return ONLY valid JSON with this exact shape:',
+        '{"decision":"assign|blocked|awaiting_connection|awaiting_approval","agentId":"agent-id-or-empty","reason":"short explanation","requiredCapabilities":["capability"],"requiredApps":["toolkit"],"notes":["optional note"]}',
+        'Rules:',
+        '- Prefer the best-fit specialist instead of always keeping work on main.',
+        '- If no one on the team is clearly suitable, return "blocked".',
+        '- If the task needs an app connection or auth that is likely missing, return "awaiting_connection".',
+        '- If the task needs human sign-off before sending/publishing/deleting, return "awaiting_approval".',
+        '- Never call a task completed at this stage. You are only routing it.',
+        '',
+        `Task: ${taskRecord.message}`,
+        `Preferred assignee: ${preferredAgentId || 'none'}`,
+        `Inferred requirements: ${JSON.stringify(requirements)}`,
+        `Team roster: ${JSON.stringify(roster.map((agent) => ({
+            id: agent.id,
+            label: agent.label,
+            model: agent.model,
+            capabilities: agent.profile.capabilities,
+            toolkits: agent.profile.toolkits,
+            canTakeExternalAction: agent.profile.canTakeExternalAction,
+            summary: agent.profile.summary
+        })))}`
+    ].join('\n');
+
+    const runAgentCli = async ({ agentId, sessionId, message }) => {
         const output = await runDockerExec(containerName, [
             'agent',
-            '--agent', taskRecord.agentId || 'main',
-            '--session-id', taskRecord.id,
-            '--message', taskRecord.message,
+            '--agent', agentId,
+            '--session-id', sessionId,
+            '--message', message,
             '--json'
         ]);
-
         const parsed = extractJsonObject(output);
-        const summary = parsed?.payloads?.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
+        const text = parsed?.payloads?.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
             || parsed?.meta?.lastDecision?.reason
-            || 'Task completed';
-        const finishedAt = new Date().toISOString();
+            || output;
         const modelProvider = parsed?.meta?.agentMeta?.provider || '';
         const modelName = parsed?.meta?.agentMeta?.model || '';
-        const resolvedModel = modelProvider && modelName ? `${modelProvider}/${modelName}` : (taskRecord.model || '');
+        return {
+            output,
+            parsed,
+            text: String(text || '').trim(),
+            model: modelProvider && modelName ? `${modelProvider}/${modelName}` : ''
+        };
+    };
 
-        upsertTaskRecord(instanceId, {
-            ...taskRecord,
-            status: 'completed',
-            updatedAt: finishedAt,
-            model: resolvedModel,
-            narrative: summary ? [{ ts: finishedAt, agentId: taskRecord.agentId || 'main', role: 'assistant', text: summary }] : [],
-            lastDecision: summary ? { ts: finishedAt, reason: summary } : null,
-            lastRun: {
-                ts: finishedAt,
-                summary,
-                output,
-                error: null
+    const heuristicDecision = chooseHeuristicAssignee(roster, requirements, preferredAgentId);
+    let managerDecision = null;
+
+    workingTask = {
+        ...workingTask,
+        status: 'triage',
+        agentId: MANAGER_AGENT_ID,
+        managerAgentId: MANAGER_AGENT_ID,
+        requestedAgentId: preferredAgentId,
+        requiredCapabilities: requirements.capabilities,
+        requiredApps: requirements.requiredApps,
+        updatedAt: startedAt,
+        log: [...(taskRecord.log || []), { ts: startedAt, role: 'system', text: 'Task handed to Mission Manager for triage' }]
+    };
+    upsertTaskRecord(instanceId, workingTask);
+
+    try {
+        const managerRun = await runAgentCli({
+            agentId: MANAGER_AGENT_ID,
+            sessionId: `${taskRecord.id}-manager`,
+            message: managerPrompt
+        }).catch(() => null);
+
+        if (managerRun?.text) {
+            managerDecision = parseManagerDecision(managerRun.text);
+        }
+
+        if (!managerDecision) {
+            if (heuristicDecision.assignee) {
+                managerDecision = {
+                    decision: 'assign',
+                    agentId: heuristicDecision.assignee.id,
+                    reason: heuristicDecision.reason,
+                    requiredCapabilities: requirements.capabilities,
+                    requiredApps: requirements.requiredApps,
+                    notes: ['Fallback routing logic used because manager response was not parseable.']
+                };
+            } else {
+                managerDecision = {
+                    decision: requirements.needsExternalAction ? 'awaiting_connection' : 'blocked',
+                    agentId: '',
+                    reason: heuristicDecision.reason,
+                    requiredCapabilities: requirements.capabilities,
+                    requiredApps: requirements.requiredApps,
+                    notes: ['Fallback routing logic used because manager response was not parseable.']
+                };
+            }
+        }
+
+        const rosterAgentIds = new Set(roster.map((agent) => agent.id));
+        if (managerDecision.agentId && !rosterAgentIds.has(managerDecision.agentId)) {
+            managerDecision.agentId = '';
+        }
+
+        if (managerDecision.decision === 'assign' && !managerDecision.agentId) {
+            managerDecision.decision = requirements.needsExternalAction ? 'awaiting_connection' : 'blocked';
+            managerDecision.reason = managerDecision.reason || 'Manager did not select a valid assignee.';
+        }
+
+        const routedAt = new Date().toISOString();
+        const managerNarrative = {
+            ts: routedAt,
+            agentId: MANAGER_AGENT_ID,
+            role: 'assistant',
+            text: managerDecision.decision === 'assign'
+                ? `Assigned to ${managerDecision.agentId}. ${managerDecision.reason}`
+                : managerDecision.reason || 'Task could not be assigned.',
+        };
+
+        if (managerDecision.decision !== 'assign') {
+            const blockedStatus = managerDecision.decision === 'awaiting_approval'
+                ? 'awaiting_approval'
+                : managerDecision.decision === 'awaiting_connection'
+                    ? 'awaiting_connection'
+                    : 'blocked';
+
+            workingTask = {
+                ...workingTask,
+                status: blockedStatus,
+                agentId: MANAGER_AGENT_ID,
+                assignedAgentId: '',
+                managerAgentId: MANAGER_AGENT_ID,
+                requestedAgentId: preferredAgentId,
+                requiredCapabilities: managerDecision.requiredCapabilities || requirements.capabilities,
+                requiredApps: managerDecision.requiredApps || requirements.requiredApps,
+                updatedAt: routedAt,
+                narrative: [managerNarrative],
+                manager: {
+                    decision: blockedStatus,
+                    agentId: '',
+                    reason: managerDecision.reason,
+                    notes: managerDecision.notes || []
+                },
+                lastDecision: { ts: routedAt, reason: managerDecision.reason || 'Task blocked during triage' },
+                lastRun: {
+                    ts: routedAt,
+                    summary: managerDecision.reason || 'Task blocked during triage',
+                    output: managerRun?.output || '',
+                    error: null
+                },
+                log: [
+                    ...(taskRecord.log || []),
+                    { ts: startedAt, role: 'system', text: 'Task triage started' },
+                    { ts: routedAt, role: 'assistant', text: managerDecision.reason || 'Task blocked during triage' }
+                ]
+            };
+            upsertTaskRecord(instanceId, workingTask);
+            return;
+        }
+
+        const assignee = roster.find((agent) => agent.id === managerDecision.agentId) || heuristicDecision.assignee;
+        const assignmentAt = new Date().toISOString();
+        const assignedTaskRecord = {
+            ...workingTask,
+            status: 'assigned',
+            agentId: assignee?.id || managerDecision.agentId,
+            assignedAgentId: assignee?.id || managerDecision.agentId,
+            managerAgentId: MANAGER_AGENT_ID,
+            requestedAgentId: preferredAgentId,
+            requiredCapabilities: managerDecision.requiredCapabilities || requirements.capabilities,
+            requiredApps: managerDecision.requiredApps || requirements.requiredApps,
+            updatedAt: assignmentAt,
+            model: assignee?.model || taskRecord.model || '',
+            narrative: [managerNarrative],
+            manager: {
+                decision: 'assign',
+                agentId: assignee?.id || managerDecision.agentId,
+                reason: managerDecision.reason,
+                notes: managerDecision.notes || []
             },
+            lastDecision: { ts: assignmentAt, reason: managerDecision.reason || `Assigned to ${assignee?.id || managerDecision.agentId}` },
             log: [
                 ...(taskRecord.log || []),
-                { ts: startedAt, role: 'system', text: 'Task execution started' },
-                { ts: finishedAt, role: 'assistant', text: summary || 'Task completed' }
+                { ts: startedAt, role: 'system', text: 'Task triage started' },
+                { ts: assignmentAt, role: 'assistant', text: managerDecision.reason || `Assigned to ${assignee?.id || managerDecision.agentId}` }
             ]
+        };
+        workingTask = assignedTaskRecord;
+        upsertTaskRecord(instanceId, assignedTaskRecord);
+
+        const workerPrompt = [
+            'You are executing a delegated Mission Control task.',
+            `Manager: ${MANAGER_IDENTITY_NAME}`,
+            `Assigned agent: ${assignee?.label || managerDecision.agentId}`,
+            `Task: ${taskRecord.message}`,
+            `Manager reason: ${managerDecision.reason || 'Best fit for the task.'}`,
+            `Required capabilities: ${(managerDecision.requiredCapabilities || requirements.capabilities).join(', ') || 'general execution'}`,
+            `Required apps: ${(managerDecision.requiredApps || requirements.requiredApps).join(', ') || 'none explicitly required'}`,
+            'Finish with ONLY valid JSON using this shape:',
+            '{"status":"completed|blocked|awaiting_connection|awaiting_approval|failed","summary":"what happened","needs":["missing dependency or approval"],"evidence":["proof points"],"followUps":["next actions"]}',
+            'Rules:',
+            '- Do not claim completion unless the outcome actually happened.',
+            '- If a required app/account/tool is missing, use awaiting_connection.',
+            '- If a human needs to review or approve before sending/posting/deleting, use awaiting_approval.',
+            '- If this task should be reassigned or cannot be completed by you, use blocked and explain why.'
+        ].join('\n');
+
+        workingTask = {
+            ...assignedTaskRecord,
+            status: 'in_progress',
+            updatedAt: assignmentAt,
+            log: [
+                ...assignedTaskRecord.log,
+                { ts: assignmentAt, role: 'system', text: `Execution started by ${assignee?.id || managerDecision.agentId}` }
+            ]
+        };
+        upsertTaskRecord(instanceId, workingTask);
+
+        const workerRun = await runAgentCli({
+            agentId: assignee?.id || managerDecision.agentId,
+            sessionId: taskRecord.id,
+            message: workerPrompt
         });
+        const outcome = parseTaskOutcome(workerRun.text);
+        const finishedAt = new Date().toISOString();
+        const finalStatus = ['completed', 'blocked', 'awaiting_connection', 'awaiting_approval', 'failed'].includes(outcome.status)
+            ? outcome.status
+            : 'completed';
+        const finalSummary = outcome.summary || 'Task run completed without a structured summary.';
+        const narrative = [
+            managerNarrative,
+            {
+                ts: finishedAt,
+                agentId: assignee?.id || managerDecision.agentId,
+                role: 'assistant',
+                text: finalSummary
+            }
+        ];
+
+        workingTask = {
+            ...workingTask,
+            status: finalStatus,
+            updatedAt: finishedAt,
+            model: workerRun.model || workingTask.model,
+            narrative,
+            lastDecision: { ts: finishedAt, reason: finalSummary },
+            lastRun: {
+                ts: finishedAt,
+                summary: finalSummary,
+                output: workerRun.output,
+                error: null,
+                needs: outcome.needs,
+                evidence: outcome.evidence,
+                followUps: outcome.followUps
+            },
+            log: [
+                ...assignedTaskRecord.log,
+                { ts: assignmentAt, role: 'system', text: `Execution started by ${assignee?.id || managerDecision.agentId}` },
+                { ts: finishedAt, role: 'assistant', text: finalSummary }
+            ]
+        };
+        upsertTaskRecord(instanceId, workingTask);
     } catch (err) {
         const finishedAt = new Date().toISOString();
-        upsertTaskRecord(instanceId, {
-            ...taskRecord,
+        workingTask = {
+            ...workingTask,
             status: 'failed',
+            agentId: workingTask.assignedAgentId || workingTask.agentId || MANAGER_AGENT_ID,
+            managerAgentId: MANAGER_AGENT_ID,
+            requestedAgentId: preferredAgentId,
+            requiredCapabilities: workingTask.requiredCapabilities || requirements.capabilities,
+            requiredApps: workingTask.requiredApps || requirements.requiredApps,
             updatedAt: finishedAt,
             lastRun: {
                 ts: finishedAt,
@@ -629,11 +1191,12 @@ async function executeTaskRecord(instanceId, taskRecord) {
                 error: err.message
             },
             log: [
-                ...(taskRecord.log || []),
+                ...(workingTask.log || []),
                 { ts: startedAt, role: 'system', text: 'Task execution started' },
                 { ts: finishedAt, role: 'system', text: `Task failed: ${err.message}` }
             ]
-        });
+        };
+        upsertTaskRecord(instanceId, workingTask);
     }
 }
 
@@ -1396,14 +1959,21 @@ app.post('/api/internal/agents-list', requireInternal, async (req, res) => {
             .filter((agent) => agent && typeof agent === 'object' && agent.id)
             .map((agent) => {
                 const resolvedModel = normalizeModelOverride(agent.model, config.agents?.defaults?.model || {});
+                const profile = inferAgentProfile({
+                    id: agent.id,
+                    label: agent.name || (agent.id === MANAGER_AGENT_ID ? MANAGER_IDENTITY_NAME : agent.id),
+                    files: readAgentProfile(instanceId, agent.id).files
+                });
                 return {
                     id: agent.id,
-                    name: agent.name || agent.id,
+                    name: agent.name || (agent.id === MANAGER_AGENT_ID ? MANAGER_IDENTITY_NAME : agent.id),
                     workspace: agent.workspace,
                     agentDir: agent.agentDir,
                     model: resolvedModel.primary,
                     primaryModel: resolvedModel.primary,
                     fallbacks: resolvedModel.fallbacks,
+                    capabilities: profile.capabilities,
+                    toolkits: profile.toolkits,
                     source: 'config'
                 };
             })
@@ -1933,7 +2503,7 @@ app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
     const config = readInstanceConfig(instanceId);
     const defaultsModel = config?.agents?.defaults?.model || {};
     const configuredAgent = Array.isArray(config?.agents?.list)
-        ? config.agents.list.find((agent) => agent?.id === (agentId || 'main'))
+        ? config.agents.list.find((agent) => agent?.id === MANAGER_AGENT_ID)
         : null;
     const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaultsModel).primary;
 
@@ -1941,18 +2511,24 @@ app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
         id: taskId,
         name: String(name || `Task: ${String(message).slice(0, 60)}`).trim(),
         message: String(message).trim(),
-        agentId: String(agentId || 'main').trim() || 'main',
+        agentId: MANAGER_AGENT_ID,
+        assignedAgentId: '',
+        managerAgentId: MANAGER_AGENT_ID,
+        requestedAgentId: String(agentId || '').trim(),
         priority: Number(priority) || 3,
-        status: 'assigned',
+        status: 'triage',
         createdAt: now,
         updatedAt: now,
         model: resolvedModel,
         narrative: [],
         log: [
-            { ts: now, role: 'system', text: 'Task created from Mission Control' }
+            { ts: now, role: 'system', text: 'Task created from Mission Control and queued for manager triage' }
         ],
         lastRun: null,
-        lastDecision: null
+        lastDecision: null,
+        requiredCapabilities: [],
+        requiredApps: [],
+        manager: null
     };
 
     upsertTaskRecord(instanceId, taskRecord);
@@ -1966,7 +2542,7 @@ app.post('/api/internal/tasks-create', requireInternal, async (req, res) => {
     return res.json({
         ok: true,
         taskId,
-        sessionKey: `agent:${taskRecord.agentId}:${taskId}`,
+        sessionKey: `agent:${MANAGER_AGENT_ID}:${taskId}`,
         status: taskRecord.status
     });
 });
@@ -2088,8 +2664,151 @@ function extractIdentityNameFromMarkdown(markdown) {
     return heading?.[1]?.trim() || '';
 }
 
+function buildManagerProfile() {
+    const profile = {
+        role: 'manager',
+        capabilities: ['triage', 'planning', 'coordination', 'review', 'research', 'writing'],
+        toolkits: [],
+        taskTypes: ['triage', 'planning', 'research', 'writing', 'delegation'],
+        connectedApps: [],
+        canTakeExternalAction: false,
+        responsibilities: [
+            { status: 'assign', meaning: 'Choose the strongest owner and explain why.' },
+            { status: 'blocked', meaning: 'No one in the team can safely own this yet.' },
+            { status: 'awaiting_connection', meaning: 'A tool or app connection must be completed first.' },
+            { status: 'awaiting_approval', meaning: 'Human approval is required before the final step.' }
+        ],
+        summary: 'Routes new tasks, keeps state honest, and only marks work complete when the outcome is verified.'
+    };
+
+    return {
+        profile,
+        identityMd: [
+            `# ${MANAGER_IDENTITY_NAME}`,
+            '',
+            `You are ${MANAGER_IDENTITY_NAME}, the main agent for this workspace.`,
+            'You own intake, delegation, escalation, verification, and operator-facing updates.',
+            'Do not pretend work is complete when it is only planned, drafted, or waiting on a missing connection.'
+        ].join('\n'),
+        soulMd: [
+            '# Working Style',
+            '',
+            'Operate like a calm operations lead.',
+            'Route work deliberately, keep statuses honest, and explain blockers in plain language.',
+            'Prefer explicit handoffs, verification, and useful comments over optimistic assumptions.'
+        ].join('\n'),
+        agentsMd: [
+            '# Mission Control Charter',
+            '',
+            renderMissionControlProfile(profile),
+            '',
+            '## Core Responsibilities',
+            '- Triage every new task before execution.',
+            '- Assign work to the best-fit specialist when one exists.',
+            '- If no specialist is a good match, either handle the task yourself when it is safe or leave a blocker comment.',
+            '- For external actions such as sending email, posting, publishing, or deleting, require verification before marking a task complete.',
+            '- When a task is blocked, say exactly what is missing: capability gap, missing app connection, or human approval.',
+            '',
+            '## Status Rules',
+            '- `assigned`: the best owner has been selected.',
+            '- `in_progress`: the assigned agent is actively working.',
+            '- `awaiting_connection`: an app or account must be connected first.',
+            '- `awaiting_approval`: a human needs to review before the last step.',
+            '- `blocked`: no safe path is available with the current team.',
+            '- `completed`: the requested outcome actually happened and was verified.',
+            '',
+            '## Team Behavior',
+            '- Prefer specialists for domain work.',
+            '- Keep handoffs explicit: who owns the task, why they were chosen, and what done looks like.',
+            '- Leave concise comments so the dashboard reads like an operations log, not a black box.'
+        ].join('\n')
+    };
+}
+
+function buildSpecialistProfile({ agentId, label, identityMd, soulMd, agentsMd }) {
+    const inferred = inferAgentProfile({
+        id: agentId,
+        label,
+        files: { identityMd, soulMd, agentsMd }
+    });
+    const profile = {
+        role: inferred.role,
+        capabilities: inferred.capabilities,
+        toolkits: inferred.toolkits,
+        taskTypes: inferred.taskTypes,
+        connectedApps: inferred.connectedApps,
+        canTakeExternalAction: inferred.canTakeExternalAction,
+        responsibilities: [
+            { status: 'completed', meaning: 'Use only when the requested outcome really happened.' },
+            { status: 'blocked', meaning: 'Use when you are not the right owner or something fundamental is missing.' },
+            { status: 'awaiting_connection', meaning: 'Use when an app or account needs to be connected first.' },
+            { status: 'awaiting_approval', meaning: 'Use when the work is ready but needs human sign-off.' }
+        ],
+        summary: inferred.summary || `${label || agentId} owns focused specialist work inside this workspace.`
+    };
+
+    return {
+        profile,
+        identityMd: String(identityMd || '').trim() || [
+            `# ${label || 'Specialist agent'}`,
+            '',
+            `You are ${label || 'a specialist agent'}.`,
+            'Own the domain you were created for, communicate clearly, and stay aligned with the workspace mission.'
+        ].join('\n'),
+        soulMd: String(soulMd || '').trim() || [
+            '# Working Style',
+            '',
+            'Operate with calm judgment, evidence-driven thinking, and direct communication.',
+            'Prefer depth over speed when the task is ambiguous, and summarize tradeoffs clearly.'
+        ].join('\n'),
+        agentsMd: String(agentsMd || '').trim() || [
+            '# Operating Rules',
+            '',
+            renderMissionControlProfile(profile),
+            '',
+            `You are the ${label || 'specialist'} agent.`,
+            'Accept delegated tasks from the main manager and report blockers explicitly.',
+            'Do not claim a task is complete unless the requested outcome actually happened.',
+            'If a tool, app connection, or approval is missing, say so directly and use the correct status.'
+        ].join('\n')
+    };
+}
+
+function ensureManagerProfileForInstance(instanceId, config, { force = false } = {}) {
+    const workspace = getMainWorkspace(instanceId);
+    ensureDirSync(workspace);
+    const manager = buildManagerProfile();
+    const identityPath = path.join(workspace, 'IDENTITY.md');
+    const soulPath = path.join(workspace, 'SOUL.md');
+    const agentsPath = path.join(workspace, 'AGENTS.md');
+
+    if (force || !fs.existsSync(identityPath) || !String(fs.readFileSync(identityPath, 'utf8')).trim()) {
+        fs.writeFileSync(identityPath, `${manager.identityMd.trim()}\n`, 'utf8');
+    }
+    if (force || !fs.existsSync(soulPath) || !String(fs.readFileSync(soulPath, 'utf8')).trim()) {
+        fs.writeFileSync(soulPath, `${manager.soulMd.trim()}\n`, 'utf8');
+    }
+    if (force || !fs.existsSync(agentsPath) || !String(fs.readFileSync(agentsPath, 'utf8')).trim()) {
+        fs.writeFileSync(agentsPath, `${manager.agentsMd.trim()}\n`, 'utf8');
+    }
+
+    if (config && typeof config === 'object') {
+        config.agents = config.agents || {};
+        config.agents.defaults = config.agents.defaults || {};
+        config.agents.defaults.identity = config.agents.defaults.identity || {};
+        if (force || !String(config.agents.defaults.identity.name || '').trim()) {
+            config.agents.defaults.identity.name = MANAGER_IDENTITY_NAME;
+        }
+        config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+        const mainAgent = config.agents.list.find((agent) => agent?.id === MANAGER_AGENT_ID);
+        if (mainAgent && (force || !String(mainAgent.name || '').trim())) {
+            mainAgent.name = MANAGER_IDENTITY_NAME;
+        }
+    }
+}
+
 function readAgentProfile(instanceId, agentId) {
-    const workspace = getAgentHostWorkspace(instanceId, agentId);
+    const workspace = getAgentWorkspacePath(instanceId, agentId);
     const identityMd = readTextFileIfExists(path.join(workspace, 'IDENTITY.md'));
     const soulMd = readTextFileIfExists(path.join(workspace, 'SOUL.md'));
     const agentsMd = readTextFileIfExists(path.join(workspace, 'AGENTS.md'));
@@ -2105,7 +2824,7 @@ function readAgentProfile(instanceId, agentId) {
 }
 
 function syncAgentIdentityName(instanceId, agentId, nextName) {
-    const workspace = getAgentHostWorkspace(instanceId, agentId);
+    const workspace = getAgentWorkspacePath(instanceId, agentId);
     const identityPath = path.join(workspace, 'IDENTITY.md');
     const current = readTextFileIfExists(identityPath);
     if (!current) return;
@@ -2150,36 +2869,27 @@ function ensureAgentListEntry(config, agentId, label, model) {
     config.agents.list.push(next);
 }
 
-function writeAgentProfileFiles(workspaceDir, { label, identityMd, soulMd, agentsMd }) {
+function writeAgentProfileFiles(workspaceDir, { agentId, label, identityMd, soulMd, agentsMd }) {
     const normalizedLabel = String(label || '').trim() || 'Specialist agent';
+    const specialist = buildSpecialistProfile({
+        agentId: String(agentId || normalizedLabel.toLowerCase().replace(/[^a-z0-9-]/g, '-')),
+        label: normalizedLabel,
+        identityMd,
+        soulMd,
+        agentsMd
+    });
     const files = [
         {
             name: 'IDENTITY.md',
-            content: String(identityMd || '').trim() || [
-                `# ${normalizedLabel}`,
-                '',
-                `You are ${normalizedLabel}.`,
-                'Own the domain you were created for, communicate clearly, and stay aligned with the workspace mission.'
-            ].join('\n')
+            content: specialist.identityMd
         },
         {
             name: 'SOUL.md',
-            content: String(soulMd || '').trim() || [
-                '# Working Style',
-                '',
-                'Operate with calm judgment, evidence-driven thinking, and direct communication.',
-                'Prefer depth over speed when the task is ambiguous, and summarize tradeoffs clearly.'
-            ].join('\n')
+            content: specialist.soulMd
         },
         {
             name: 'AGENTS.md',
-            content: String(agentsMd || '').trim() || [
-                '# Operating Rules',
-                '',
-                `You are the ${normalizedLabel} agent.`,
-                'Start by clarifying the objective, gather the strongest evidence available, and produce structured outputs.',
-                'Escalate uncertainties instead of guessing, and keep notes concise and useful for the rest of the team.'
-            ].join('\n')
+            content: specialist.agentsMd
         }
     ];
 
@@ -2232,7 +2942,7 @@ async function createAgentViaConfig(instanceId, agentId, options = {}) {
     if (!config) throw new Error('Config not found');
 
     const targetWorkspace = ensureAgentWorkspaceOnDisk(instanceId, agentId);
-    writeAgentProfileFiles(targetWorkspace, { label, identityMd, soulMd, agentsMd });
+    writeAgentProfileFiles(targetWorkspace, { agentId, label, identityMd, soulMd, agentsMd });
     await ensureWorkspaceOwnership(targetWorkspace);
     ensureAgentListEntry(config, agentId, label, model);
     writeInstanceConfig(instanceId, config);
