@@ -1672,11 +1672,7 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
             if (String(createError).includes('missing scope: operator.admin')) {
                 console.warn(`[vps-agent] agents.create is admin-gated for ${instanceId}; using config fallback for ${agentId}`);
                 const fallback = await createAgentViaConfig(instanceId, agentId, label, model);
-                const chatResult = await gatewayWsExec(container, gatewayToken, 'chat.send', {
-                    sessionKey: `agent:${agentId}:${agentId}`,
-                    message: task,
-                    idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
-                });
+                const chatResult = await dispatchAgentTask(container, gatewayToken, agentId, task);
                 return res.json({
                     ok: true,
                     mode: 'config-fallback',
@@ -1696,11 +1692,7 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
         }
 
         // Step 2: Send the initial task message
-        const chatResult = await gatewayWsExec(container, gatewayToken, 'chat.send', {
-            sessionKey: `agent:${agentId}:${agentId}`,
-            message: task,
-            idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
-        });
+        const chatResult = await dispatchAgentTask(container, gatewayToken, agentId, task);
         console.log(`[vps-agent] chat.send to ${agentId}:`, JSON.stringify(chatResult).slice(0, 200));
 
         res.json({
@@ -1728,6 +1720,10 @@ function getAgentContainerWorkspace(agentId) {
 
 function getAgentHostWorkspace(instanceId, agentId) {
     return path.join(INSTANCES_DIR, instanceId, 'agents', agentId);
+}
+
+async function ensureWorkspaceOwnership(workspacePath) {
+    await run('chown', ['-R', '1000:1000', workspacePath]);
 }
 
 function ensureAgentListEntry(config, agentId, label, model) {
@@ -1792,6 +1788,7 @@ async function createAgentViaConfig(instanceId, agentId, label, model) {
     if (!config) throw new Error('Config not found');
 
     const targetWorkspace = ensureAgentWorkspaceOnDisk(instanceId, agentId);
+    await ensureWorkspaceOwnership(targetWorkspace);
     ensureAgentListEntry(config, agentId, label, model);
     writeInstanceConfig(instanceId, config);
 
@@ -1800,6 +1797,8 @@ async function createAgentViaConfig(instanceId, agentId, label, model) {
     } catch (err) {
         console.warn(`[vps-agent] composio setup skipped for ${instanceId}/${agentId}: ${err.message}`);
     }
+
+    await ensureWorkspaceOwnership(targetWorkspace);
 
     await restartGateway(`openclaw-${instanceId}`);
     return {
@@ -1834,6 +1833,35 @@ async function deleteAgentFromConfig(instanceId, agentId) {
 
     await restartGateway(`openclaw-${instanceId}`);
     return { ok: true, deleted: true, mode: 'config-fallback', agentId };
+}
+
+async function dispatchAgentTask(containerName, gatewayToken, agentId, task) {
+    const sessionKey = `agent:${agentId}:${agentId}`;
+
+    if (gatewayToken) {
+        const chatResult = await gatewayWsExec(containerName, gatewayToken, 'chat.send', {
+            sessionKey,
+            message: task,
+            idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        });
+        if (chatResult?.ok !== false) {
+            return chatResult?.payload || chatResult;
+        }
+
+        const message = String(chatResult?.error?.message || '');
+        if (!message.includes('missing scope: operator.write')) {
+            return chatResult?.payload || chatResult;
+        }
+
+        console.warn(`[vps-agent] chat.send is write-gated for ${agentId}; using CLI fallback`);
+    }
+
+    const output = await runDockerExec(containerName, ['agent', '--agent', agentId, '--message', task, '--json']);
+    return {
+        ok: true,
+        mode: 'cli-fallback',
+        output,
+    };
 }
 
 function isMem0PluginInstalled(instanceId) {
