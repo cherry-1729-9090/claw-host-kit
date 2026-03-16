@@ -1265,9 +1265,60 @@ app.post('/api/internal/models-list', requireInternal, async (req, res) => {
     }
 });
 
+// ── Raw chat sessions/history for Mission Control UI ─────────────────────────
+app.post('/api/internal/chat-sessions', requireInternal, async (req, res) => {
+    const { instanceId, limit } = req.body || {};
+    if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'sessions.list', {});
+        const sessions = result?.payload?.sessions || result?.payload || [];
+        const list = Array.isArray(sessions) ? sessions : [];
+        const max = Math.max(1, Math.min(Number(limit) || 30, 200));
+        const sorted = [...list].sort((a, b) => Number(b?.updatedAt || 0) - Number(a?.updatedAt || 0));
+        res.json({ sessions: sorted.slice(0, max) });
+    } catch (err) {
+        console.error(`[vps-agent] chat-sessions failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message, sessions: [] });
+    }
+});
+
+app.post('/api/internal/chat-history', requireInternal, async (req, res) => {
+    const { instanceId, sessionKey, limit, includeTools } = req.body || {};
+    if (!instanceId || !sessionKey) return res.status(400).json({ error: 'instanceId and sessionKey are required' });
+    const config = readInstanceConfig(instanceId);
+    if (!config) return res.status(404).json({ error: 'Config not found' });
+    const gatewayToken = config.gateway?.auth?.token;
+    if (!gatewayToken) return res.status(500).json({ error: 'No gateway token found' });
+
+    try {
+        const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'chat.history', { sessionKey });
+        let messages = result?.payload?.messages || result?.payload || [];
+        messages = Array.isArray(messages) ? messages : [];
+
+        if (!includeTools) {
+            messages = messages.filter((entry) => {
+                const role = String(entry?.message?.role || entry?.role || '').toLowerCase();
+                return role !== 'toolresult' && role !== 'tool_result' && role !== 'tool';
+            });
+        }
+
+        const max = Math.max(1, Math.min(Number(limit) || 100, 500));
+        if (messages.length > max) messages = messages.slice(-max);
+        res.json({ messages });
+    } catch (err) {
+        console.error(`[vps-agent] chat-history failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message, messages: [] });
+    }
+});
+
 // ── Sessions list (WebSocket sessions.list → mapped to jobs) ─────────────────
 app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
-    const { instanceId, ids, limit, includeNarrative, includeLog } = req.body;
+    const { instanceId, ids, limit, includeNarrative, includeLog, onlyTaskSessions } = req.body;
     if (!instanceId) return res.status(400).json({ error: 'instanceId is required' });
     const config = readInstanceConfig(instanceId);
     if (!config) return res.status(404).json({ error: 'Config not found' });
@@ -1278,7 +1329,15 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
     try {
         const result = await gatewayWsExec(container, gatewayToken, 'sessions.list', {});
         const sessions = result?.payload?.sessions || result?.payload || [];
-        const list = Array.isArray(sessions) ? sessions : [];
+        let list = Array.isArray(sessions) ? sessions : [];
+
+        if (!ids && onlyTaskSessions) {
+            list = list.filter((session) => {
+                const key = String(session?.key || session?.sessionKey || '');
+                const sessionPart = key.split(':')[2] || '';
+                return sessionPart.startsWith('task-') || sessionPart.startsWith('bcast-');
+            });
+        }
 
         let jobs = [];
         let sessionsToEnrich = [];
@@ -1303,7 +1362,7 @@ app.post('/api/internal/sessions-list', requireInternal, async (req, res) => {
                     const history = await gatewayWsExec(container, gatewayToken, 'chat.history', { sessionKey: key });
                     const messages = history?.payload?.messages || history?.payload || [];
                     if (Array.isArray(messages) && messages.length) {
-                        enrichJobWithHistory(job, messages);
+                        enrichJobWithHistory(job, messages, { includeLog });
                     }
                 } catch { /* keep basic info */ }
             }
@@ -1323,6 +1382,141 @@ function extractContent(content) {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) return content.map(c => c.text || c.content || '').join('');
     return '';
+}
+
+function normalizeTranscriptText(text) {
+    return String(text || '')
+        .replace(/\uFEFF/g, '')
+        .replace(/^Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/i, '')
+        .replace(/^Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/i, '')
+        .replace(/^\[Inter-session message\]\s*/i, '')
+        .trim();
+}
+
+function extractNarrativeText(content) {
+    if (typeof content === 'string') return normalizeTranscriptText(content);
+    if (!Array.isArray(content)) return '';
+
+    const chunks = [];
+    for (const part of content) {
+        if (part === undefined || part === null) continue;
+        if (typeof part === 'string') {
+            chunks.push(part);
+            continue;
+        }
+        if (typeof part !== 'object') {
+            chunks.push(String(part));
+            continue;
+        }
+
+        const type = String(part.type || '').toLowerCase();
+        if (type === 'thinking' || type === 'reasoning' || type === 'toolcall' || type === 'tool_call' || type === 'tooluse' || type === 'tool_use') {
+            continue;
+        }
+
+        if (part.text) {
+            chunks.push(part.text);
+            continue;
+        }
+
+        if (part.content) {
+            chunks.push(extractNarrativeText(part.content));
+        }
+    }
+
+    return normalizeTranscriptText(chunks.join(''));
+}
+
+function enrichJobWithHistory(job, messages, options = {}) {
+    const { includeLog = false } = options;
+    if (!Array.isArray(messages) || !messages.length) return job;
+
+    const narrative = [];
+    const log = [];
+    let firstUserMessage = '';
+    let lastAssistantMessage = '';
+    let lastTimestamp = job?.metadata?.updatedAt || null;
+
+    for (const entry of messages) {
+        if (!entry || typeof entry !== 'object') continue;
+
+        const message = entry.message && typeof entry.message === 'object' ? entry.message : entry;
+        const role = String(message.role || entry.role || '').toLowerCase();
+        const timestamp = entry.timestamp || message.timestamp || null;
+        if (timestamp) lastTimestamp = timestamp;
+
+        if (role === 'toolresult' || role === 'tool_result' || role === 'tool') {
+            const toolText = extractContent(message.content || entry.content || '');
+            if (toolText) {
+                log.push({
+                    ts: timestamp,
+                    role: 'tool',
+                    toolName: message.toolName || entry.toolName || 'tool',
+                    text: toolText
+                });
+            }
+            continue;
+        }
+
+        const text = extractNarrativeText(message.content || entry.content || '');
+        if (!text) continue;
+
+        const provenanceKind = message?.provenance?.kind || null;
+
+        if (role === 'user') {
+            if (!firstUserMessage) firstUserMessage = text;
+            if (provenanceKind === 'inter_session') {
+                narrative.push({
+                    ts: timestamp,
+                    agentId: message?.provenance?.fromAgentId || message?.provenance?.from || 'peer-agent',
+                    role: 'agent_message',
+                    text,
+                    provenanceKind
+                });
+            }
+            continue;
+        }
+
+        if (role === 'assistant') {
+            lastAssistantMessage = text;
+            narrative.push({
+                ts: timestamp,
+                agentId: job.agentId || 'main',
+                role: 'assistant',
+                text
+            });
+        }
+    }
+
+    job.payload = job.payload || {};
+    job.metadata = job.metadata || {};
+
+    if (firstUserMessage) {
+        job.payload.message = firstUserMessage;
+        job.metadata.message = firstUserMessage;
+    }
+
+    if (lastTimestamp) {
+        job.metadata.updatedAt = lastTimestamp;
+        if (!job.metadata.createdAt) job.metadata.createdAt = lastTimestamp;
+    }
+
+    job.metadata.narrative = narrative;
+    if (includeLog && log.length) job.metadata.log = log;
+
+    if (lastAssistantMessage) {
+        job.metadata.lastDecision = {
+            reason: lastAssistantMessage,
+            ts: lastTimestamp
+        };
+        job.metadata.lastRun = {
+            ...(job.metadata.lastRun || {}),
+            summary: lastAssistantMessage,
+            ts: lastTimestamp
+        };
+    }
+
+    return job;
 }
 
 function mapSessionToJob(session, key) {
