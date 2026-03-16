@@ -1117,7 +1117,7 @@ function gatewayWsExec(containerName, gatewayToken, method, params, timeoutMs = 
                         minProtocol: 3, maxProtocol: 3,
                         client: { id: 'gateway-client', version: 'dev', platform: 'linux', mode: 'backend' },
                         caps: [], auth: { token: '${gatewayToken}' },
-                        role: 'operator', scopes: ['operator.admin']
+                        role: 'operator', scopes: ['operator.read', 'operator.write']
                     }
                 }));
                 return;
@@ -1592,6 +1592,10 @@ app.post('/api/internal/agents-delete', requireInternal, async (req, res) => {
 
     try {
         const result = await gatewayWsExec(`openclaw-${instanceId}`, gatewayToken, 'agents.delete', { agentId });
+        if (result?.ok === false && String(result?.error?.message || '').includes('missing scope: operator.admin')) {
+            const fallback = await deleteAgentFromConfig(instanceId, agentId);
+            return res.json(fallback);
+        }
         res.json(result?.payload || { ok: true });
     } catch (err) {
         console.error(`[vps-agent] agents-delete failed for ${instanceId}:`, err.message);
@@ -1623,7 +1627,24 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
         console.log(`[vps-agent] agent created ${agentId}:`, JSON.stringify(createResult).slice(0, 200));
 
         if (!createResult.ok && createResult.error) {
-            return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
+            const createError = createResult.error?.message || 'Failed to create agent';
+            if (String(createError).includes('missing scope: operator.admin')) {
+                console.warn(`[vps-agent] agents.create is admin-gated for ${instanceId}; using config fallback for ${agentId}`);
+                const fallback = await createAgentViaConfig(instanceId, agentId, label, model);
+                const chatResult = await gatewayWsExec(container, gatewayToken, 'chat.send', {
+                    sessionKey: `agent:${agentId}:${agentId}`,
+                    message: task,
+                    idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
+                });
+                return res.json({
+                    ok: true,
+                    mode: 'config-fallback',
+                    agent: { id: agentId, name: label || agentId },
+                    setup: fallback,
+                    chat: chatResult?.payload || chatResult
+                });
+            }
+            return res.status(400).json({ error: createError });
         }
 
         try {
@@ -1657,6 +1678,120 @@ app.post('/api/internal/subagents-spawn', requireInternal, async (req, res) => {
 function writeInstanceConfig(instanceId, config) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+}
+
+function getAgentContainerWorkspace(agentId) {
+    return `/home/node/.openclaw/agents/${agentId}`;
+}
+
+function getAgentHostWorkspace(instanceId, agentId) {
+    return path.join(INSTANCES_DIR, instanceId, 'agents', agentId);
+}
+
+function ensureAgentListEntry(config, agentId, label, model) {
+    config.agents = config.agents || {};
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+    const existing = config.agents.list.find((agent) => agent?.id === agentId);
+    if (existing) {
+        throw new Error(`Agent "${agentId}" already exists`);
+    }
+
+    const next = {
+        id: agentId,
+        name: label || agentId,
+        workspace: getAgentContainerWorkspace(agentId),
+        agentDir: `${getAgentContainerWorkspace(agentId)}/agent`
+    };
+
+    if (model) next.model = model;
+    config.agents.list.push(next);
+}
+
+function ensureAgentWorkspaceOnDisk(instanceId, agentId) {
+    const instanceRoot = path.join(INSTANCES_DIR, instanceId);
+    const sourceWorkspace = path.join(instanceRoot, 'workspace');
+    const targetWorkspace = getAgentHostWorkspace(instanceId, agentId);
+    const mainAgentDir = path.join(instanceRoot, 'agents', 'main', 'agent');
+
+    if (!fs.existsSync(sourceWorkspace)) {
+        throw new Error(`Workspace template missing for ${instanceId}`);
+    }
+    if (fs.existsSync(targetWorkspace)) {
+        throw new Error(`Agent workspace already exists for ${agentId}`);
+    }
+
+    fs.mkdirSync(path.dirname(targetWorkspace), { recursive: true });
+    fs.cpSync(sourceWorkspace, targetWorkspace, { recursive: true, force: false, errorOnExist: true });
+
+    const targetAgentDir = path.join(targetWorkspace, 'agent');
+    const targetSessionsDir = path.join(targetWorkspace, 'sessions');
+    fs.mkdirSync(targetAgentDir, { recursive: true });
+    fs.mkdirSync(targetSessionsDir, { recursive: true });
+
+    const mainModelsPath = path.join(mainAgentDir, 'models.json');
+    if (fs.existsSync(mainModelsPath)) {
+        fs.copyFileSync(mainModelsPath, path.join(targetAgentDir, 'models.json'));
+    }
+
+    const authCandidates = [
+        path.join(mainAgentDir, 'auth-profiles.json'),
+        path.join(instanceRoot, 'auth-profiles.json'),
+    ];
+    const authSource = authCandidates.find((candidate) => fs.existsSync(candidate));
+    if (authSource) {
+        fs.copyFileSync(authSource, path.join(targetAgentDir, 'auth-profiles.json'));
+    }
+
+    return targetWorkspace;
+}
+
+async function createAgentViaConfig(instanceId, agentId, label, model) {
+    const config = readInstanceConfig(instanceId);
+    if (!config) throw new Error('Config not found');
+
+    const targetWorkspace = ensureAgentWorkspaceOnDisk(instanceId, agentId);
+    ensureAgentListEntry(config, agentId, label, model);
+    writeInstanceConfig(instanceId, config);
+
+    try {
+        await ensureComposioForInstance(instanceId, [targetWorkspace]);
+    } catch (err) {
+        console.warn(`[vps-agent] composio setup skipped for ${instanceId}/${agentId}: ${err.message}`);
+    }
+
+    await restartGateway(`openclaw-${instanceId}`);
+    return {
+        ok: true,
+        workspace: getAgentContainerWorkspace(agentId),
+        agentDir: `${getAgentContainerWorkspace(agentId)}/agent`,
+        mode: 'config-fallback'
+    };
+}
+
+async function deleteAgentFromConfig(instanceId, agentId) {
+    if (agentId === 'main') {
+        throw new Error('Refusing to delete main agent');
+    }
+
+    const config = readInstanceConfig(instanceId);
+    if (!config) throw new Error('Config not found');
+
+    const before = Array.isArray(config.agents?.list) ? config.agents.list.length : 0;
+    config.agents = config.agents || {};
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list.filter((agent) => agent?.id !== agentId) : [];
+    if (config.agents.list.length === before) {
+        throw new Error(`Agent "${agentId}" not found`);
+    }
+
+    writeInstanceConfig(instanceId, config);
+
+    const targetWorkspace = getAgentHostWorkspace(instanceId, agentId);
+    if (fs.existsSync(targetWorkspace)) {
+        fs.rmSync(targetWorkspace, { recursive: true, force: true });
+    }
+
+    await restartGateway(`openclaw-${instanceId}`);
+    return { ok: true, deleted: true, mode: 'config-fallback', agentId };
 }
 
 function isMem0PluginInstalled(instanceId) {
