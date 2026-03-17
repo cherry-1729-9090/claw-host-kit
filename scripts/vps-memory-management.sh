@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # VPS Memory Management Script for 24GB RAM with 5 OpenClaw Containers
-# Optimizes memory allocation: 2GB reserved, 4GB max per container
+# Optimizes memory allocation: 2GB reserved, 4GB max per container, 2048 pids per container
 
 set -e
 
@@ -59,6 +59,7 @@ update_openclaw_memory() {
     echo "   • Memory Reservation: 2GB (soft limit)"
     echo "   • Memory Limit: 4GB (hard limit)"
     echo "   • Memory Swap: 4GB (no extra swap)"
+    echo "   • PID Limit: 2048"
     echo ""
     
     for CONTAINER in $CONTAINERS; do
@@ -68,6 +69,7 @@ update_openclaw_memory() {
             --memory=4g \
             --memory-reservation=2g \
             --memory-swap=4g \
+            --pids-limit=2048 \
             "$CONTAINER" 2>/dev/null; then
             echo "   ✅ Success"
         else
@@ -143,22 +145,23 @@ validate_setup() {
     for CONTAINER in $(docker ps --filter "name=openclaw-user_" --format "{{.Names}}" 2>/dev/null); do
         MEM_LIMIT=$(docker inspect "$CONTAINER" --format '{{.HostConfig.Memory}}' 2>/dev/null)
         MEM_RESERVATION=$(docker inspect "$CONTAINER" --format '{{.HostConfig.MemoryReservation}}' 2>/dev/null)
+        PIDS_LIMIT=$(docker inspect "$CONTAINER" --format '{{.HostConfig.PidsLimit}}' 2>/dev/null)
         
         # Convert to GB (bytes to GB)
         MEM_LIMIT_GB=$((MEM_LIMIT / 1024 / 1024 / 1024))
         MEM_RESERVATION_GB=$((MEM_RESERVATION / 1024 / 1024 / 1024))
         
-        if [ "$MEM_LIMIT_GB" -ne 4 ] || [ "$MEM_RESERVATION_GB" -ne 2 ]; then
-            echo "   ⚠️  $CONTAINER: ${MEM_RESERVATION_GB}GB reserved, ${MEM_LIMIT_GB}GB max (should be 2GB/4GB)"
+        if [ "$MEM_LIMIT_GB" -ne 4 ] || [ "$MEM_RESERVATION_GB" -ne 2 ] || [ "${PIDS_LIMIT:-0}" -ne 2048 ]; then
+            echo "   ⚠️  $CONTAINER: ${MEM_RESERVATION_GB}GB reserved, ${MEM_LIMIT_GB}GB max, ${PIDS_LIMIT} pids (should be 2GB/4GB/2048)"
             INCORRECT=$((INCORRECT + 1))
         fi
     done
     
     if [ "$INCORRECT" -gt 0 ]; then
-        echo "   ⚠️  $INCORRECT container(s) need memory limit adjustment"
+        echo "   ⚠️  $INCORRECT container(s) need resource limit adjustment"
         echo "   Run: $0 update"
     else
-        echo "   ✅ All containers have correct memory limits (2GB/4GB)"
+        echo "   ✅ All containers have correct resource limits (2GB/4GB/2048)"
     fi
     echo ""
 }

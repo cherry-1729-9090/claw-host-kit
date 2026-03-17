@@ -499,7 +499,16 @@ const TASKS_STORE_FILE = 'mission-control-tasks.json';
 function readInstanceConfig(instanceId) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     if (!fs.existsSync(configPath)) return null;
-    try { return JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { return null; }
+    try {
+        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const { config: sanitizedConfig, changed } = sanitizeInstanceConfig(parsed);
+        if (changed) {
+            fs.writeFileSync(configPath, JSON.stringify(sanitizedConfig, null, 2), 'utf8');
+        }
+        return sanitizedConfig;
+    } catch {
+        return null;
+    }
 }
 
 function getTasksStorePath(instanceId) {
@@ -1408,6 +1417,9 @@ function sanitizeInstanceConfig(config) {
     }
 
     let changed = false;
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
     const defaults = config.agents?.defaults;
     if (defaults && defaults.models) {
         const sanitized = sanitizeAllowedModelsMap(defaults.models);
@@ -1415,6 +1427,34 @@ function sanitizeInstanceConfig(config) {
             defaults.models = sanitized.models;
             changed = true;
         }
+    }
+
+    if (defaults && Object.prototype.hasOwnProperty.call(defaults, 'identity')) {
+        const legacyIdentity = defaults.identity && typeof defaults.identity === 'object' ? defaults.identity : {};
+        let mainAgent = config.agents.list.find((agent) => agent?.id === MANAGER_AGENT_ID);
+        if (!mainAgent) {
+            mainAgent = {
+                id: MANAGER_AGENT_ID,
+                workspace: '/home/node/.openclaw',
+                agentDir: '/home/node/.openclaw/agent'
+            };
+            config.agents.list.unshift(mainAgent);
+        }
+
+        const nextName = String(legacyIdentity?.name || '').trim();
+        const nextEmoji = String(legacyIdentity?.emoji || '').trim();
+        if (nextName && !String(mainAgent.name || '').trim()) {
+            mainAgent.name = nextName;
+        }
+        if (nextEmoji) {
+            mainAgent.identity = mainAgent.identity || {};
+            if (!String(mainAgent.identity.emoji || '').trim()) {
+                mainAgent.identity.emoji = nextEmoji;
+            }
+        }
+
+        delete defaults.identity;
+        changed = true;
     }
 
     return { config, changed };
@@ -2248,8 +2288,8 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
     const configuredAgent = configuredAgents.find((agent) => agent?.id === agentId) || null;
     const profile = readAgentProfile(instanceId, agentId);
     const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaults.model || {});
-    const identityName = configuredAgent?.name || profile.identityName || defaults.identity?.name || '';
-    const identityEmoji = defaults.identity?.emoji || '';
+    const identityName = configuredAgent?.identity?.name || configuredAgent?.name || profile.identityName || '';
+    const identityEmoji = configuredAgent?.identity?.emoji || '';
 
     res.json({
         id: agentId,
@@ -2288,20 +2328,38 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
 
     if (agentId === 'main') {
         const target = config.agents.defaults;
+        let mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
+        if (!mainAgent) {
+            mainAgent = {
+                id: 'main',
+                name: MANAGER_IDENTITY_NAME,
+                workspace: '/home/node/.openclaw',
+                agentDir: '/home/node/.openclaw/agent'
+            };
+            config.agents.list.unshift(mainAgent);
+        }
         if (updates.model) {
             target.model = target.model || {};
             if (updates.model.primary !== undefined) target.model.primary = updates.model.primary;
             if (updates.model.fallbacks !== undefined) target.model.fallbacks = updates.model.fallbacks;
 
-            const mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
             if (mainAgent && updates.model.primary !== undefined) {
                 mainAgent.model = updates.model.primary;
             }
         }
         if (updates.identity) {
-            target.identity = target.identity || {};
-            if (updates.identity.name !== undefined) target.identity.name = updates.identity.name;
-            if (updates.identity.emoji !== undefined) target.identity.emoji = updates.identity.emoji;
+            mainAgent.identity = mainAgent.identity || {};
+            if (updates.identity.name !== undefined) {
+                const nextName = String(updates.identity.name || '').trim();
+                mainAgent.name = nextName || MANAGER_IDENTITY_NAME;
+                mainAgent.identity.name = nextName || MANAGER_IDENTITY_NAME;
+                syncAgentIdentityName(instanceId, agentId, mainAgent.name);
+            }
+            if (updates.identity.emoji !== undefined) {
+                const nextEmoji = String(updates.identity.emoji || '').trim();
+                if (nextEmoji) mainAgent.identity.emoji = nextEmoji;
+                else delete mainAgent.identity.emoji;
+            }
         }
     } else {
         const agentEntry = config.agents.list.find((agent) => agent?.id === agentId);
@@ -2356,8 +2414,8 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
                     fallbacks: resolvedModel.fallbacks
                 },
                 identity: {
-                    name: currentAgent.name || refreshed.identityName || defaults.identity?.name || '',
-                    emoji: defaults.identity?.emoji || ''
+                    name: currentAgent.identity?.name || currentAgent.name || refreshed.identityName || '',
+                    emoji: currentAgent.identity?.emoji || ''
                 },
                 files: refreshed.files
             }
@@ -3336,13 +3394,18 @@ function ensureManagerProfileForInstance(instanceId, config, { force = false } =
     if (config && typeof config === 'object') {
         config.agents = config.agents || {};
         config.agents.defaults = config.agents.defaults || {};
-        config.agents.defaults.identity = config.agents.defaults.identity || {};
-        if (force || !String(config.agents.defaults.identity.name || '').trim()) {
-            config.agents.defaults.identity.name = MANAGER_IDENTITY_NAME;
-        }
         config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
-        const mainAgent = config.agents.list.find((agent) => agent?.id === MANAGER_AGENT_ID);
-        if (mainAgent && (force || !String(mainAgent.name || '').trim())) {
+        let mainAgent = config.agents.list.find((agent) => agent?.id === MANAGER_AGENT_ID);
+        if (!mainAgent) {
+            mainAgent = {
+                id: MANAGER_AGENT_ID,
+                name: MANAGER_IDENTITY_NAME,
+                workspace: '/home/node/.openclaw',
+                agentDir: '/home/node/.openclaw/agent'
+            };
+            config.agents.list.unshift(mainAgent);
+        }
+        if (force || !String(mainAgent.name || '').trim()) {
             mainAgent.name = MANAGER_IDENTITY_NAME;
         }
     }
