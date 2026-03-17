@@ -687,6 +687,27 @@ function extractJsonObject(rawOutput) {
     return null;
 }
 
+function extractAgentRunEnvelope(parsed) {
+    if (!parsed || typeof parsed !== 'object') {
+        return { payloads: [], meta: {}, summary: '' };
+    }
+
+    const payloads = Array.isArray(parsed?.payloads)
+        ? parsed.payloads
+        : Array.isArray(parsed?.result?.payloads)
+            ? parsed.result.payloads
+            : [];
+
+    const meta = parsed?.meta && typeof parsed.meta === 'object'
+        ? parsed.meta
+        : parsed?.result?.meta && typeof parsed.result.meta === 'object'
+            ? parsed.result.meta
+            : {};
+
+    const summary = String(parsed?.summary || parsed?.result?.summary || '').trim();
+    return { payloads, meta, summary };
+}
+
 const CAPABILITY_RULES = [
     { tag: 'triage', keywords: ['triage', 'route', 'assign', 'delegate', 'manager', 'coordinate', 'coordination', 'orchestrate'] },
     { tag: 'research', keywords: ['research', 'investigate', 'analyze', 'analysis', 'deep dive', 'compare', 'internet', 'web'] },
@@ -906,8 +927,12 @@ function taskRequiresStrictConnection(requirements) {
 function parseManagerDecision(text) {
     const parsed = extractEmbeddedJson(text);
     if (!parsed || typeof parsed !== 'object') return null;
+    const decision = String(parsed.decision || '').trim().toLowerCase();
+    if (!['assign', 'blocked', 'awaiting_connection', 'awaiting_approval'].includes(decision)) {
+        return null;
+    }
     return {
-        decision: String(parsed.decision || '').trim().toLowerCase(),
+        decision,
         agentId: String(parsed.agentId || '').trim(),
         reason: String(parsed.reason || '').trim(),
         requiredCapabilities: normalizeTagList(parsed.requiredCapabilities || []),
@@ -1101,11 +1126,13 @@ async function executeTaskRecord(instanceId, taskRecord) {
             '--json'
         ]);
         const parsed = extractJsonObject(output);
-        const text = parsed?.payloads?.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
-            || parsed?.meta?.lastDecision?.reason
+        const envelope = extractAgentRunEnvelope(parsed);
+        const text = envelope.payloads.map((entry) => entry?.text).filter(Boolean).join('\n\n').trim()
+            || envelope.meta?.lastDecision?.reason
+            || envelope.summary
             || output;
-        const modelProvider = parsed?.meta?.agentMeta?.provider || '';
-        const modelName = parsed?.meta?.agentMeta?.model || '';
+        const modelProvider = envelope.meta?.agentMeta?.provider || '';
+        const modelName = envelope.meta?.agentMeta?.model || '';
         return {
             output,
             parsed,
