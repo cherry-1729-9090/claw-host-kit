@@ -1236,6 +1236,16 @@ async function executeTaskRecord(instanceId, taskRecord) {
             managerDecision.agentId = '';
         }
 
+        if (!managerDecision.agentId
+            && (managerDecision.decision === 'awaiting_approval' || managerDecision.decision === 'awaiting_connection')
+            && heuristicDecision.assignee) {
+            managerDecision.agentId = heuristicDecision.assignee.id;
+            managerDecision.notes = [
+                ...(managerDecision.notes || []),
+                'Mission Control preserved the best-fit assignee so the paused task can resume with the right owner.'
+            ];
+        }
+
         if (managerDecision.decision === 'assign'
             && managerDecision.agentId === MANAGER_AGENT_ID
             && heuristicDecision.assignee
