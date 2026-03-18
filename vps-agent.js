@@ -669,6 +669,10 @@ function upsertTaskRecord(instanceId, taskRecord) {
     writeTasksStore(instanceId, nextTasks.slice(0, 1000));
 }
 
+function getTaskRecord(instanceId, taskId) {
+    return readTasksStore(instanceId).find((task) => task?.id === taskId) || null;
+}
+
 function extractJsonObject(rawOutput) {
     const text = String(rawOutput || '').trim();
     if (!text) return null;
@@ -1089,7 +1093,8 @@ function mapStoredTaskToJob(task, options = {}) {
         lastRun: task?.lastRun || null,
         requiredCapabilities: normalizeTagList(task?.requiredCapabilities || []),
         requiredApps: normalizeTagList(task?.requiredApps || []),
-        manager: task?.manager || null
+        manager: task?.manager || null,
+        approval: task?.approval || null
     };
 
     if (includeNarrative) metadata.narrative = narrative;
@@ -1118,7 +1123,13 @@ async function executeTaskRecord(instanceId, taskRecord) {
     ensureManagerProfileForInstance(instanceId, config, { force: false });
     const roster = buildAgentRoster(instanceId, config);
     const requirements = inferTaskRequirements(taskRecord.message);
-    const preferredAgentId = String(taskRecord.requestedAgentId || '').trim();
+    const approvalGranted = String(taskRecord?.approval?.status || '').trim().toLowerCase() === 'approved';
+    const effectiveRequirements = approvalGranted
+        ? { ...requirements, needsApproval: false }
+        : requirements;
+    const preferredAgentId = approvalGranted
+        ? String(taskRecord.assignedAgentId || taskRecord.requestedAgentId || '').trim()
+        : String(taskRecord.requestedAgentId || '').trim();
 
     const managerPrompt = [
         'You are the Mission Control manager agent.',
@@ -1134,7 +1145,8 @@ async function executeTaskRecord(instanceId, taskRecord) {
         '',
         `Task: ${taskRecord.message}`,
         `Preferred assignee: ${preferredAgentId || 'none'}`,
-        `Inferred requirements: ${JSON.stringify(requirements)}`,
+        `Inferred requirements: ${JSON.stringify(effectiveRequirements)}`,
+        approvalGranted ? `Human approval already granted: ${JSON.stringify(taskRecord.approval)}` : '',
         `Team roster: ${JSON.stringify(roster.map((agent) => ({
             id: agent.id,
             label: agent.label,
@@ -1170,7 +1182,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
         };
     };
 
-    const heuristicDecision = chooseHeuristicAssignee(roster, requirements, preferredAgentId);
+    const heuristicDecision = chooseHeuristicAssignee(roster, effectiveRequirements, preferredAgentId);
     let managerDecision = null;
 
     workingTask = {
@@ -1179,8 +1191,8 @@ async function executeTaskRecord(instanceId, taskRecord) {
         agentId: MANAGER_AGENT_ID,
         managerAgentId: MANAGER_AGENT_ID,
         requestedAgentId: preferredAgentId,
-        requiredCapabilities: requirements.capabilities,
-        requiredApps: requirements.requiredApps,
+        requiredCapabilities: effectiveRequirements.capabilities,
+        requiredApps: effectiveRequirements.requiredApps,
         updatedAt: startedAt,
         log: [...(taskRecord.log || []), { ts: startedAt, role: 'system', text: 'Task handed to Mission Manager for triage' }]
     };
@@ -1203,17 +1215,17 @@ async function executeTaskRecord(instanceId, taskRecord) {
                     decision: 'assign',
                     agentId: heuristicDecision.assignee.id,
                     reason: heuristicDecision.reason,
-                    requiredCapabilities: requirements.capabilities,
-                    requiredApps: requirements.requiredApps,
+                    requiredCapabilities: effectiveRequirements.capabilities,
+                    requiredApps: effectiveRequirements.requiredApps,
                     notes: ['Fallback routing logic used because manager response was not parseable.']
                 };
             } else {
                 managerDecision = {
-                    decision: requirements.needsExternalAction ? 'awaiting_connection' : 'blocked',
+                    decision: effectiveRequirements.needsExternalAction ? 'awaiting_connection' : 'blocked',
                     agentId: '',
                     reason: heuristicDecision.reason,
-                    requiredCapabilities: requirements.capabilities,
-                    requiredApps: requirements.requiredApps,
+                    requiredCapabilities: effectiveRequirements.capabilities,
+                    requiredApps: effectiveRequirements.requiredApps,
                     notes: ['Fallback routing logic used because manager response was not parseable.']
                 };
             }
@@ -1235,7 +1247,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
 
         if (managerDecision.decision !== 'assign'
             && heuristicDecision.assignee
-            && !taskRequiresStrictConnection(requirements)) {
+            && !taskRequiresStrictConnection(effectiveRequirements)) {
             const previousDecision = managerDecision.decision;
             managerDecision.decision = 'assign';
             managerDecision.agentId = heuristicDecision.assignee.id;
@@ -1243,8 +1255,21 @@ async function executeTaskRecord(instanceId, taskRecord) {
             managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control overrode a non-assignment because a specialist match was available.'];
         }
 
+        if (approvalGranted && managerDecision.decision === 'awaiting_approval') {
+            if (managerDecision.agentId) {
+                managerDecision.decision = 'assign';
+                managerDecision.reason = `Human approval has already been granted. ${managerDecision.reason || 'Continue execution with the selected agent.'}`;
+                managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control resumed the task after operator approval.'];
+            } else if (heuristicDecision.assignee) {
+                managerDecision.decision = 'assign';
+                managerDecision.agentId = heuristicDecision.assignee.id;
+                managerDecision.reason = `Human approval has already been granted. ${heuristicDecision.reason}`;
+                managerDecision.notes = [...(managerDecision.notes || []), 'Mission Control resumed the task after operator approval.'];
+            }
+        }
+
         if (managerDecision.decision === 'assign' && !managerDecision.agentId) {
-            managerDecision.decision = requirements.needsExternalAction ? 'awaiting_connection' : 'blocked';
+            managerDecision.decision = effectiveRequirements.needsExternalAction ? 'awaiting_connection' : 'blocked';
             managerDecision.reason = managerDecision.reason || 'Manager did not select a valid assignee.';
         }
 
@@ -1268,17 +1293,17 @@ async function executeTaskRecord(instanceId, taskRecord) {
             workingTask = {
                 ...workingTask,
                 status: blockedStatus,
-                agentId: MANAGER_AGENT_ID,
-                assignedAgentId: '',
+                agentId: managerDecision.agentId || MANAGER_AGENT_ID,
+                assignedAgentId: managerDecision.agentId || '',
                 managerAgentId: MANAGER_AGENT_ID,
                 requestedAgentId: preferredAgentId,
-                requiredCapabilities: managerDecision.requiredCapabilities || requirements.capabilities,
-                requiredApps: managerDecision.requiredApps || requirements.requiredApps,
+                requiredCapabilities: managerDecision.requiredCapabilities || effectiveRequirements.capabilities,
+                requiredApps: managerDecision.requiredApps || effectiveRequirements.requiredApps,
                 updatedAt: routedAt,
                 narrative: [managerNarrative],
                 manager: {
                     decision: blockedStatus,
-                    agentId: '',
+                    agentId: managerDecision.agentId || '',
                     reason: managerDecision.reason,
                     notes: managerDecision.notes || []
                 },
@@ -1335,8 +1360,9 @@ async function executeTaskRecord(instanceId, taskRecord) {
             `Assigned agent: ${assignee?.label || managerDecision.agentId}`,
             `Task: ${taskRecord.message}`,
             `Manager reason: ${managerDecision.reason || 'Best fit for the task.'}`,
-            `Required capabilities: ${(managerDecision.requiredCapabilities || requirements.capabilities).join(', ') || 'general execution'}`,
-            `Required apps: ${(managerDecision.requiredApps || requirements.requiredApps).join(', ') || 'none explicitly required'}`,
+            `Required capabilities: ${(managerDecision.requiredCapabilities || effectiveRequirements.capabilities).join(', ') || 'general execution'}`,
+            `Required apps: ${(managerDecision.requiredApps || effectiveRequirements.requiredApps).join(', ') || 'none explicitly required'}`,
+            approvalGranted ? 'Human approval has already been granted for this task. Do not return awaiting_approval solely because the task sends email or performs another already-approved action.' : '',
             'Finish with ONLY valid JSON using this shape:',
             '{"status":"completed|blocked|awaiting_connection|awaiting_approval|failed","summary":"what happened","needs":["missing dependency or approval"],"evidence":["proof points"],"followUps":["next actions"]}',
             'Rules:',
@@ -1367,7 +1393,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
             message: workerPrompt
         });
         const outcome = parseTaskOutcome(workerRun.text);
-        const guard = inferExternalActionGuards({ requirements, workerRun });
+        const guard = inferExternalActionGuards({ requirements: effectiveRequirements, workerRun });
         const finishedAt = new Date().toISOString();
         const finalStatus = guard.status
             || (['completed', 'blocked', 'awaiting_connection', 'awaiting_approval', 'failed'].includes(outcome.status)
@@ -3229,6 +3255,95 @@ app.post('/api/internal/tasks-list', requireInternal, async (req, res) => {
 
     const jobs = tasksToMap.map((task) => mapStoredTaskToJob(task, { includeNarrative, includeLog }));
     res.json({ jobs });
+});
+
+app.post('/api/internal/tasks-action', requireInternal, async (req, res) => {
+    const { instanceId, taskId, action, note } = req.body || {};
+    if (!instanceId || !taskId || !action) {
+        return res.status(400).json({ error: 'instanceId, taskId, and action are required' });
+    }
+
+    const existingTask = getTaskRecord(instanceId, taskId);
+    if (!existingTask) {
+        return res.status(404).json({ error: `Task "${taskId}" not found` });
+    }
+
+    const now = new Date().toISOString();
+    const cleanedNote = String(note || '').trim();
+    const currentStatus = String(existingTask.status || '').trim().toLowerCase();
+
+    if (action === 'approve') {
+        if (currentStatus !== 'awaiting_approval') {
+            return res.status(409).json({ error: `Task "${taskId}" is not awaiting approval` });
+        }
+
+        const approvedTask = {
+            ...existingTask,
+            status: 'triage',
+            updatedAt: now,
+            requestedAgentId: existingTask.assignedAgentId || existingTask.requestedAgentId || '',
+            approval: {
+                status: 'approved',
+                approvedAt: now,
+                note: cleanedNote
+            },
+            log: [
+                ...(existingTask.log || []),
+                { ts: now, role: 'system', text: cleanedNote ? `Task approved from Mission Control: ${cleanedNote}` : 'Task approved from Mission Control' }
+            ]
+        };
+        upsertTaskRecord(instanceId, approvedTask);
+        queueMicrotask(() => {
+            executeTaskRecord(instanceId, approvedTask).catch((err) => {
+                console.error(`[vps-agent] approved task resume failed for ${instanceId}/${taskId}:`, err.message);
+            });
+        });
+        return res.json({ ok: true, taskId, action, status: approvedTask.status });
+    }
+
+    if (action === 'retry') {
+        const resumedTask = {
+            ...existingTask,
+            status: 'triage',
+            updatedAt: now,
+            log: [
+                ...(existingTask.log || []),
+                { ts: now, role: 'system', text: cleanedNote ? `Task retried from Mission Control: ${cleanedNote}` : 'Task retried from Mission Control' }
+            ]
+        };
+        upsertTaskRecord(instanceId, resumedTask);
+        queueMicrotask(() => {
+            executeTaskRecord(instanceId, resumedTask).catch((err) => {
+                console.error(`[vps-agent] task retry failed for ${instanceId}/${taskId}:`, err.message);
+            });
+        });
+        return res.json({ ok: true, taskId, action, status: resumedTask.status });
+    }
+
+    if (action === 'reject') {
+        const rejectedTask = {
+            ...existingTask,
+            status: 'blocked',
+            updatedAt: now,
+            lastDecision: {
+                ts: now,
+                reason: cleanedNote || 'Operator rejected this task.'
+            },
+            lastRun: {
+                ...(existingTask.lastRun || {}),
+                ts: now,
+                summary: cleanedNote || 'Operator rejected this task.'
+            },
+            log: [
+                ...(existingTask.log || []),
+                { ts: now, role: 'system', text: cleanedNote ? `Task rejected from Mission Control: ${cleanedNote}` : 'Task rejected from Mission Control' }
+            ]
+        };
+        upsertTaskRecord(instanceId, rejectedTask);
+        return res.json({ ok: true, taskId, action, status: rejectedTask.status });
+    }
+
+    return res.status(400).json({ error: `Unsupported action "${action}"` });
 });
 
 // ── Agent delete (WebSocket agents.delete) ───────────────────────────────────
