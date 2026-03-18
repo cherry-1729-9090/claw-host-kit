@@ -43,6 +43,8 @@ const DEFAULT_PROVIDER_API = process.env.OPENCLAW_DEFAULT_PROVIDER_API || 'opena
 const DEFAULT_PRIMARY_MODEL_RAW = process.env.OPENCLAW_DEFAULT_PRIMARY_MODEL || `${DEFAULT_PROVIDER_KEY}/workers-ai/@cf/nvidia/nemotron-3-120b-a12b`;
 const MANAGER_AGENT_ID = 'main';
 const MANAGER_IDENTITY_NAME = 'Mission Manager';
+const CONTROL_UI_CLIENT_ID = 'openclaw-control-ui';
+const CONTROL_UI_OPERATOR_SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write'];
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -528,6 +530,14 @@ function readInstanceConfig(instanceId) {
     const configPath = path.join(INSTANCES_DIR, instanceId, 'openclaw.json');
     if (!fs.existsSync(configPath)) return null;
     try {
+        try {
+            const scopeSync = ensureControlUiDeviceScopes(instanceId);
+            if (scopeSync.changed) {
+                console.log(`[vps-agent] repaired Control UI device scopes for ${instanceId} (${scopeSync.repaired} device${scopeSync.repaired === 1 ? '' : 's'})`);
+            }
+        } catch (error) {
+            console.warn(`[vps-agent] unable to repair Control UI device scopes for ${instanceId}: ${error.message}`);
+        }
         const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
         const { config: sanitizedConfig, changed } = sanitizeInstanceConfig(parsed);
         if (changed) {
@@ -541,6 +551,72 @@ function readInstanceConfig(instanceId) {
 
 function getTasksStorePath(instanceId) {
     return path.join(INSTANCES_DIR, instanceId, TASKS_STORE_FILE);
+}
+
+function getPairedDevicesPath(instanceId) {
+    return path.join(INSTANCES_DIR, instanceId, 'devices', 'paired.json');
+}
+
+function normalizeScopeList(values) {
+    return Array.from(new Set((Array.isArray(values) ? values : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)));
+}
+
+function ensureControlUiDeviceScopes(instanceId) {
+    const pairedPath = getPairedDevicesPath(instanceId);
+    if (!fs.existsSync(pairedPath)) return { changed: false, repaired: 0 };
+
+    let parsed;
+    try {
+        parsed = JSON.parse(fs.readFileSync(pairedPath, 'utf8'));
+    } catch {
+        return { changed: false, repaired: 0 };
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+        return { changed: false, repaired: 0 };
+    }
+
+    let changed = false;
+    let repaired = 0;
+    for (const entry of Object.values(parsed)) {
+        if (!entry || typeof entry !== 'object') continue;
+        if (String(entry.clientId || '').trim() !== CONTROL_UI_CLIENT_ID) continue;
+        if (String(entry.role || '').trim() !== 'operator') continue;
+        let entryChanged = false;
+
+        const nextScopes = normalizeScopeList([...(entry.scopes || []), ...CONTROL_UI_OPERATOR_SCOPES]);
+        const nextApprovedScopes = normalizeScopeList([...(entry.approvedScopes || []), ...CONTROL_UI_OPERATOR_SCOPES]);
+        const currentTokenScopes = normalizeScopeList(entry?.tokens?.operator?.scopes || []);
+        const nextTokenScopes = normalizeScopeList([...currentTokenScopes, ...CONTROL_UI_OPERATOR_SCOPES]);
+
+        if (JSON.stringify(nextScopes) !== JSON.stringify(normalizeScopeList(entry.scopes || []))) {
+            entry.scopes = nextScopes;
+            changed = true;
+            entryChanged = true;
+        }
+        if (JSON.stringify(nextApprovedScopes) !== JSON.stringify(normalizeScopeList(entry.approvedScopes || []))) {
+            entry.approvedScopes = nextApprovedScopes;
+            changed = true;
+            entryChanged = true;
+        }
+        if (entry?.tokens?.operator && JSON.stringify(nextTokenScopes) !== JSON.stringify(currentTokenScopes)) {
+            entry.tokens.operator.scopes = nextTokenScopes;
+            changed = true;
+            entryChanged = true;
+        }
+
+        if (entryChanged) {
+            repaired += 1;
+        }
+    }
+
+    if (changed) {
+        fs.writeFileSync(pairedPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
+    }
+
+    return { changed, repaired };
 }
 
 function getMainWorkspace(instanceId) {
