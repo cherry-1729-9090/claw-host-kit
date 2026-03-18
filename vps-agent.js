@@ -942,7 +942,8 @@ function parseManagerDecision(text) {
 }
 
 function parseTaskOutcome(text) {
-    const parsed = extractEmbeddedJson(text);
+    const summaryText = String(text || '').trim();
+    const parsed = extractEmbeddedJson(summaryText);
     if (parsed && typeof parsed === 'object') {
         return {
             status: String(parsed.status || '').trim().toLowerCase(),
@@ -953,20 +954,38 @@ function parseTaskOutcome(text) {
         };
     }
 
-    const normalized = String(text || '').toLowerCase();
+    const normalized = summaryText.toLowerCase();
+    if (/billing error|insufficient balance|insufficient credits|out of credits|run out of credits|quota exceeded|credit balance|payment required/.test(normalized)) {
+        return {
+            status: 'failed',
+            summary: summaryText || 'The model provider rejected the run because the API key has no available credits.',
+            needs: ['Restore provider credits or switch this agent to a funded model/API key.'],
+            evidence: [],
+            followUps: ['Top up the provider balance or change the agent model, then retry the task.']
+        };
+    }
+    if (/invalid api key|api key invalid|authentication failed|unauthorized|forbidden/.test(normalized) && /openrouter|openai|anthropic|provider|model/.test(normalized)) {
+        return {
+            status: 'failed',
+            summary: summaryText || 'The model provider rejected the run because the API key or provider access is invalid.',
+            needs: ['A valid provider API key with access to the selected model.'],
+            evidence: [],
+            followUps: ['Replace the provider API key or switch to a model with valid provider access, then retry the task.']
+        };
+    }
     if (/connect|authorize|not connected|missing account|authentication/.test(normalized)) {
-        return { status: 'awaiting_connection', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+        return { status: 'awaiting_connection', summary: summaryText, needs: [], evidence: [], followUps: [] };
     }
     if (/approve|approval|review before send|draft ready|ready for review/.test(normalized)) {
-        return { status: 'awaiting_approval', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+        return { status: 'awaiting_approval', summary: summaryText, needs: [], evidence: [], followUps: [] };
     }
     if (/unable|cannot|can't|blocked|no suitable/.test(normalized)) {
-        return { status: 'blocked', summary: String(text || '').trim(), needs: [], evidence: [], followUps: [] };
+        return { status: 'blocked', summary: summaryText, needs: [], evidence: [], followUps: [] };
     }
 
     return {
         status: 'completed',
-        summary: String(text || '').trim(),
+        summary: summaryText,
         needs: [],
         evidence: [],
         followUps: []
@@ -982,7 +1001,7 @@ function summarizeToolFailures(output) {
     const text = String(output || '');
     const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
     const errorLines = lines.filter((line) =>
-        /MCP error|Tool .* not found|No connection found|Authentication in progress|waiting for user to complete|missing scope|failed/i.test(line)
+        /MCP error|Tool .* not found|No connection found|Authentication in progress|waiting for user to complete|missing scope|failed|billing error|insufficient balance|out of credits|quota exceeded|invalid api key|unauthorized/i.test(line)
     );
     return Array.from(new Set(errorLines)).slice(-5);
 }
@@ -999,6 +1018,16 @@ function inferExternalActionGuards({ requirements, workerRun }) {
 
     if (!needsExternalAction) {
         return { status: null, summary: '', evidence: [], needs: [], followUps: [] };
+    }
+
+    if (/billing error|insufficient balance|insufficient credits|out of credits|run out of credits|quota exceeded|invalid api key|unauthorized|forbidden/i.test(mergedText)) {
+        return {
+            status: 'failed',
+            summary: 'The selected model provider failed before the agent could complete the task.',
+            evidence: errors.length ? errors : [text].filter(Boolean).slice(0, 1),
+            needs: ['A funded and valid provider API key for the selected model.'],
+            followUps: ['Restore provider credits or switch the task to a working model, then retry.']
+        };
     }
 
     const hasConnectionIssue = /No connection found|Authentication in progress|waiting for user to complete|authorize|not initiated/i.test(mergedText);
@@ -2315,6 +2344,8 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
     const configuredAgent = configuredAgents.find((agent) => agent?.id === agentId) || null;
     const profile = readAgentProfile(instanceId, agentId);
     const resolvedModel = normalizeModelOverride(configuredAgent?.model, defaults.model || {});
+    const defaultPrimary = normalizeModelOverride(defaults.model || {}, defaults.model || {}).primary;
+    const inheritsDefault = agentId !== 'main' && !configuredAgent?.model;
     const identityName = configuredAgent?.identity?.name || configuredAgent?.name || profile.identityName || '';
     const identityEmoji = configuredAgent?.identity?.emoji || '';
 
@@ -2325,7 +2356,9 @@ app.post('/api/internal/agent-config', requireInternal, (req, res) => {
         default: agentId === 'main',
         model: {
             primary: resolvedModel.primary,
-            fallbacks: resolvedModel.fallbacks
+            fallbacks: resolvedModel.fallbacks,
+            inherited: inheritsDefault,
+            defaultPrimary
         },
         identity: {
             name: identityName,
@@ -2432,13 +2465,17 @@ app.post('/api/internal/agent-config-update', requireInternal, async (req, res) 
         const currentAgent = config.agents.list.find((agent) => agent?.id === agentId) || {};
         const defaults = config.agents.defaults || {};
         const resolvedModel = normalizeModelOverride(currentAgent.model, defaults.model || {});
+        const defaultPrimary = normalizeModelOverride(defaults.model || {}, defaults.model || {}).primary;
+        const inheritsDefault = agentId !== 'main' && !currentAgent.model;
         res.json({
             ok: true,
             agent: {
                 id: agentId,
                 model: {
                     primary: resolvedModel.primary,
-                    fallbacks: resolvedModel.fallbacks
+                    fallbacks: resolvedModel.fallbacks,
+                    inherited: inheritsDefault,
+                    defaultPrimary
                 },
                 identity: {
                     name: currentAgent.identity?.name || currentAgent.name || refreshed.identityName || '',
