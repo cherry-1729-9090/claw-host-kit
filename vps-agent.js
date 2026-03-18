@@ -140,6 +140,34 @@ function shell(cmd) {
     });
 }
 
+function looksLikeTelegramBotToken(token) {
+    return /^[0-9]{6,}:[A-Za-z0-9_-]{20,}$/.test(String(token || '').trim());
+}
+
+async function validateTelegramBotToken(token) {
+    const trimmed = String(token || '').trim();
+    if (!looksLikeTelegramBotToken(trimmed)) {
+        return { ok: false, error: 'Telegram bot token format looks invalid.' };
+    }
+
+    try {
+        const response = await fetch(`https://api.telegram.org/bot${trimmed}/getMe`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(10_000),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data?.ok !== true) {
+            return {
+                ok: false,
+                error: data?.description || `Telegram validation failed with HTTP ${response.status}`
+            };
+        }
+        return { ok: true, username: data?.result?.username || '' };
+    } catch (error) {
+        return { ok: false, error: error?.message || 'Telegram validation request failed.' };
+    }
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 app.get('/healthz', (_, res) => res.json({ ok: true }));
@@ -3989,6 +4017,13 @@ app.post('/api/internal/channels-add', requireInternal, async (req, res) => {
         config.channels = config.channels || {};
 
         if (channel === 'telegram') {
+            const validation = await validateTelegramBotToken(token);
+            if (!validation.ok) {
+                return res.status(400).json({
+                    error: validation.error || 'Telegram bot token is invalid.',
+                    code: 'TELEGRAM_TOKEN_INVALID'
+                });
+            }
             config.channels.telegram = config.channels.telegram || {};
             config.channels.telegram.enabled = true;
             if (token) config.channels.telegram.botToken = token;
