@@ -45,6 +45,7 @@ const MANAGER_AGENT_ID = 'main';
 const MANAGER_IDENTITY_NAME = 'Mission Manager';
 const CONTROL_UI_CLIENT_ID = 'openclaw-control-ui';
 const CONTROL_UI_OPERATOR_SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write'];
+const TRUSTED_PLUGIN_IDS = [MEM0_PLUGIN_KEY];
 
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
@@ -1613,9 +1614,38 @@ function sanitizeInstanceConfig(config) {
     }
 
     let changed = false;
+    config.gateway = config.gateway || {};
+    config.gateway.controlUi = (config.gateway.controlUi && typeof config.gateway.controlUi === 'object' && !Array.isArray(config.gateway.controlUi))
+        ? config.gateway.controlUi
+        : {};
     config.agents = config.agents || {};
     config.agents.defaults = config.agents.defaults || {};
     config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+
+    const existingAllowedOrigins = Array.isArray(config.gateway.controlUi.allowedOrigins)
+        ? config.gateway.controlUi.allowedOrigins.map((value) => String(value || '').trim()).filter(Boolean)
+        : [];
+    if (existingAllowedOrigins.length > 0) {
+        if (JSON.stringify(existingAllowedOrigins) !== JSON.stringify(config.gateway.controlUi.allowedOrigins || [])) {
+            config.gateway.controlUi.allowedOrigins = existingAllowedOrigins;
+            changed = true;
+        }
+    } else if (config.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback !== true) {
+        config.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
+        changed = true;
+    }
+
+    config.plugins = config.plugins || {};
+    const currentPluginAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
+    const nextPluginAllow = Array.from(new Set([
+        ...currentPluginAllow.map((value) => String(value || '').trim()).filter(Boolean),
+        ...TRUSTED_PLUGIN_IDS,
+    ]));
+    if (JSON.stringify(nextPluginAllow) !== JSON.stringify(currentPluginAllow)) {
+        config.plugins.allow = nextPluginAllow;
+        changed = true;
+    }
+
     const defaults = config.agents?.defaults;
     if (defaults && defaults.models) {
         const sanitized = sanitizeAllowedModelsMap(defaults.models);
@@ -1919,7 +1949,25 @@ app.put('/api/internal/openclaw-config', requireInternal, (req, res) => {
             incoming.gateway = incoming.gateway || {};
             incoming.gateway.auth = existing.gateway.auth;
         }
-        fs.writeFileSync(configPath, JSON.stringify(incoming, null, 2), 'utf8');
+        if (existing.gateway?.controlUi) {
+            incoming.gateway = incoming.gateway || {};
+            incoming.gateway.controlUi = {
+                ...(existing.gateway.controlUi || {}),
+                ...((incoming.gateway?.controlUi && typeof incoming.gateway.controlUi === 'object' && !Array.isArray(incoming.gateway.controlUi))
+                    ? incoming.gateway.controlUi
+                    : {})
+            };
+        }
+        if (existing.plugins?.allow && Array.isArray(existing.plugins.allow)) {
+            incoming.plugins = incoming.plugins || {};
+            const requestedAllow = Array.isArray(incoming.plugins.allow) ? incoming.plugins.allow : [];
+            incoming.plugins.allow = Array.from(new Set([
+                ...existing.plugins.allow.map((value) => String(value || '').trim()).filter(Boolean),
+                ...requestedAllow.map((value) => String(value || '').trim()).filter(Boolean),
+            ]));
+        }
+        const { config: sanitizedConfig } = sanitizeInstanceConfig(incoming);
+        fs.writeFileSync(configPath, JSON.stringify(sanitizedConfig, null, 2), 'utf8');
         res.json({ ok: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3976,6 +4024,17 @@ async function ensureMem0ForInstance(instanceId) {
     const alreadyInstalled = isMem0PluginInstalled(instanceId);
     let installedNow = false;
     if (!alreadyInstalled) {
+        config.plugins = config.plugins || {};
+        const currentAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
+        const nextAllow = Array.from(new Set([
+            ...currentAllow.map((value) => String(value || '').trim()).filter(Boolean),
+            MEM0_PLUGIN_KEY,
+        ]));
+        if (JSON.stringify(nextAllow) !== JSON.stringify(currentAllow)) {
+            config.plugins.allow = nextAllow;
+            writeInstanceConfig(instanceId, config);
+            console.log(`[vps-agent] pinned trusted plugins before Mem0 install for ${instanceId}`);
+        }
         const currentSlot = config.plugins?.slots?.memory;
         if (currentSlot === MEM0_PLUGIN_KEY) {
             delete config.plugins.slots.memory;
