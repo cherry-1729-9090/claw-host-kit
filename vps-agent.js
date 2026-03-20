@@ -36,6 +36,8 @@ const COMPOSIO_SERVER_NAME = 'composio';
 const COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
 const COMPOSIO_HEADER_NAME = 'x-consumer-api-key';
 const COMPOSIO_API_KEY = process.env.OPENCLAW_COMPOSIO_API_KEY || '';
+const COMPOSIO_RUNTIME_APPS = ['gmail', 'slack', 'discord', 'notion', 'github', 'calendar', 'linear', 'jira'];
+const MISSION_CONTROL_RUNTIME_GUIDANCE_MARKER = '<!-- mission-control-runtime-guidance -->';
 const DEFAULT_PROVIDER_KEY = process.env.OPENCLAW_DEFAULT_PROVIDER_KEY || 'cloudflare-nemotron';
 const DEFAULT_PROVIDER_BASE_URL = process.env.OPENCLAW_DEFAULT_PROVIDER_BASE_URL || '';
 const DEFAULT_PROVIDER_API_KEY = process.env.OPENCLAW_DEFAULT_PROVIDER_API_KEY || '';
@@ -395,6 +397,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
         if (managerConfig) {
             removeBootstrapFilesForInstance(instanceId, managerConfig);
             ensureManagerProfileForInstance(instanceId, managerConfig, { force: false });
+            ensureMissionControlRuntimeGuidanceForInstance(instanceId);
             writeInstanceConfig(instanceId, managerConfig);
         }
 
@@ -750,6 +753,39 @@ function renderMissionControlProfile(profile) {
         JSON.stringify(profile, null, 2),
         '-->'
     ].join('\n');
+}
+
+function renderMissionControlRuntimeGuidanceLines() {
+    return [
+        '## Mission Control Runtime Notes',
+        '- Mission Control app connections are user-scoped and provided through Composio MCP, not native gateway channels.',
+        `- For ${COMPOSIO_RUNTIME_APPS.join(', ')} tasks, use the Composio-backed tools in the workspace when the user connected the app in Settings.`,
+        '- Do not report native-channel blockers like "Gmail channel not configured" unless a Composio tool explicitly proves the user connection is missing.',
+        '- For web research, use the available web and browser tools in the workspace before assuming a separate Brave Search API key is required.',
+        '- If a Composio tool returns "no connection found", "authentication in progress", or a similar auth error, then use awaiting_connection and name the missing app explicitly.'
+    ];
+}
+
+function renderMissionControlRuntimeGuidanceBlock() {
+    return [
+        MISSION_CONTROL_RUNTIME_GUIDANCE_MARKER,
+        ...renderMissionControlRuntimeGuidanceLines()
+    ].join('\n');
+}
+
+function ensureMissionControlRuntimeGuidanceAtWorkspace(workspaceDir) {
+    const agentsPath = path.join(workspaceDir, 'AGENTS.md');
+    const current = readTextFileIfExists(agentsPath);
+    if (current.includes(MISSION_CONTROL_RUNTIME_GUIDANCE_MARKER)) {
+        return false;
+    }
+
+    const block = renderMissionControlRuntimeGuidanceBlock();
+    const next = current.trim()
+        ? `${current.trim()}\n\n${block}\n`
+        : `${block}\n`;
+    fs.writeFileSync(agentsPath, next, 'utf8');
+    return true;
 }
 
 function readTasksStore(instanceId) {
@@ -1228,6 +1264,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
     const config = readInstanceConfig(instanceId) || {};
     removeBootstrapFilesForInstance(instanceId, config);
     ensureManagerProfileForInstance(instanceId, config, { force: false });
+    ensureMissionControlRuntimeGuidanceForInstance(instanceId);
     const roster = buildAgentRoster(instanceId, config);
     const requirements = inferTaskRequirements(taskRecord.message);
     const operatorGuidance = String(taskRecord?.operatorGuidance || '').trim();
@@ -1250,6 +1287,8 @@ async function executeTaskRecord(instanceId, taskRecord) {
         '- If the task needs an app connection or auth that is likely missing, return "awaiting_connection".',
         '- If the task needs human sign-off before sending/publishing/deleting, return "awaiting_approval".',
         '- Never call a task completed at this stage. You are only routing it.',
+        '- Mission Control user app integrations come through Composio MCP. Do not treat native Gmail, Slack, or Discord channel setup as the required connection for those app tasks.',
+        '- For research tasks, assume the agent should use the available web or browser tools in the workspace before claiming a separate Brave Search API key is required.',
         '',
         `Task: ${taskRecord.message}`,
         operatorGuidance ? `Latest operator guidance: ${operatorGuidance}` : '',
@@ -1483,6 +1522,10 @@ async function executeTaskRecord(instanceId, taskRecord) {
             `Required capabilities: ${(managerDecision.requiredCapabilities || effectiveRequirements.capabilities).join(', ') || 'general execution'}`,
             `Required apps: ${(managerDecision.requiredApps || effectiveRequirements.requiredApps).join(', ') || 'none explicitly required'}`,
             approvalGranted ? 'Human approval has already been granted for this task. Do not return awaiting_approval solely because the task sends email or performs another already-approved action.' : '',
+            'Mission Control app integrations are user-scoped through Composio MCP.',
+            `When the user has connected ${COMPOSIO_RUNTIME_APPS.join(', ')} in Settings, use the Composio-backed tools in the workspace instead of looking for native channel configuration.`,
+            'Do not report blockers like "Gmail channel not configured" unless the tool output explicitly shows the Composio connection is missing or still authorizing.',
+            'For web research, use the available web and browser tools in the workspace before claiming a missing Brave Search API key or no browser access.',
             'Finish with ONLY valid JSON using this shape:',
             '{"status":"completed|blocked|awaiting_connection|awaiting_approval|failed","summary":"what happened","needs":["missing dependency or approval"],"evidence":["proof points"],"followUps":["next actions"]}',
             'Rules:',
@@ -1762,6 +1805,14 @@ function getComposioWorkspaceDirs(instanceId, extraDirs = []) {
         ...extraDirs,
     ].filter(Boolean);
     return Array.from(new Set(dirs));
+}
+
+function ensureMissionControlRuntimeGuidanceForInstance(instanceId, extraDirs = []) {
+    const workspaceDirs = getComposioWorkspaceDirs(instanceId, extraDirs);
+    return workspaceDirs.map((workspaceDir) => ({
+        workspaceDir,
+        changed: ensureMissionControlRuntimeGuidanceAtWorkspace(workspaceDir)
+    }));
 }
 
 function buildComposioServerConfig(overrides = {}) {
@@ -3659,6 +3710,8 @@ function buildManagerProfile() {
             '',
             renderMissionControlProfile(profile),
             '',
+            renderMissionControlRuntimeGuidanceBlock(),
+            '',
             '## Core Responsibilities',
             '- Triage every new task before execution.',
             '- Assign work to the best-fit specialist when one exists.',
@@ -3722,6 +3775,8 @@ function buildSpecialistProfile({ agentId, label, identityMd, soulMd, agentsMd }
             '# Operating Rules',
             '',
             renderMissionControlProfile(profile),
+            '',
+            renderMissionControlRuntimeGuidanceBlock(),
             '',
             `You are the ${label || 'specialist'} agent.`,
             'Accept delegated tasks from the main manager and report blockers explicitly.',
@@ -3907,6 +3962,7 @@ async function createAgentViaConfig(instanceId, agentId, options = {}) {
 
     const targetWorkspace = ensureAgentWorkspaceOnDisk(instanceId, agentId);
     writeAgentProfileFiles(targetWorkspace, { agentId, label, identityMd, soulMd, agentsMd });
+    ensureMissionControlRuntimeGuidanceForInstance(instanceId, [targetWorkspace]);
     await ensureWorkspaceOwnership(targetWorkspace);
     ensureAgentListEntry(config, agentId, label, model);
     writeInstanceConfig(instanceId, config);
