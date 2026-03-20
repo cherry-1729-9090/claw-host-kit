@@ -761,6 +761,7 @@ function renderMissionControlRuntimeGuidanceLines() {
         '- Mission Control app connections are user-scoped and provided through Composio MCP, not native gateway channels.',
         `- For ${COMPOSIO_RUNTIME_APPS.join(', ')} tasks, use the Composio-backed tools in the workspace when the user connected the app in Settings.`,
         '- Do not report native-channel blockers like "Gmail channel not configured" unless a Composio tool explicitly proves the user connection is missing.',
+        '- Do not use the native `message` tool for Gmail. That tool is for OpenClaw messaging channels, not Composio-backed inbox access.',
         '- For web research, use the available web and browser tools in the workspace before assuming a separate Brave Search API key is required.',
         '- If a Composio tool returns "no connection found", "authentication in progress", or a similar auth error, then use awaiting_connection and name the missing app explicitly.'
     ];
@@ -1151,7 +1152,7 @@ function summarizeToolFailures(output) {
     return Array.from(new Set(errorLines)).slice(-5);
 }
 
-function inferExternalActionGuards({ requirements, workerRun }) {
+function inferExternalActionGuards({ requirements, workerRun, composioConfigured = false }) {
     const output = String(workerRun?.output || '');
     const text = String(workerRun?.text || '');
     const mergedText = `${text}\n${output}`;
@@ -1172,6 +1173,22 @@ function inferExternalActionGuards({ requirements, workerRun }) {
             evidence: errors.length ? errors : [text].filter(Boolean).slice(0, 1),
             needs: ['A funded and valid provider API key for the selected model.'],
             followUps: ['Restore provider credits or switch the task to a working model, then retry.']
+        };
+    }
+
+    if (requiredApps.includes('gmail') && (/unknown channel:\s*gmail|gmail channel not configured|channel is required/i.test(mergedText))) {
+        return {
+            status: composioConfigured ? 'failed' : 'awaiting_connection',
+            summary: composioConfigured
+                ? 'The run tried to use OpenClaw messaging channels instead of the Composio-backed Gmail integration.'
+                : 'Gmail is not configured through the expected integration path yet.',
+            evidence: errors.length ? errors : [text].filter(Boolean).slice(0, 2),
+            needs: composioConfigured
+                ? ['Retry with the Composio-backed Gmail integration instead of the native message channel.']
+                : ['A valid user-scoped Gmail connection through Composio.'],
+            followUps: composioConfigured
+                ? ['Retry the task after prompt refresh. Do not use the native `message` tool with channel `gmail`.']
+                : ['Reconnect Gmail in Mission Control and retry so the Composio session can sync into the instance.']
         };
     }
 
@@ -1269,6 +1286,8 @@ async function executeTaskRecord(instanceId, taskRecord) {
     const requirements = inferTaskRequirements(taskRecord.message);
     const operatorGuidance = String(taskRecord?.operatorGuidance || '').trim();
     const approvalGranted = String(taskRecord?.approval?.status || '').trim().toLowerCase() === 'approved';
+    const composioServer = resolveComposioServerConfig(instanceId);
+    const composioConfigured = Boolean(composioServer?.url && composioServer?.headers && Object.keys(composioServer.headers).length > 0);
     const effectiveRequirements = approvalGranted
         ? { ...requirements, needsApproval: false }
         : requirements;
@@ -1288,12 +1307,14 @@ async function executeTaskRecord(instanceId, taskRecord) {
         '- If the task needs human sign-off before sending/publishing/deleting, return "awaiting_approval".',
         '- Never call a task completed at this stage. You are only routing it.',
         '- Mission Control user app integrations come through Composio MCP. Do not treat native Gmail, Slack, or Discord channel setup as the required connection for those app tasks.',
+        '- Do not assume Gmail is available through the native `message` tool. Gmail in Mission Control should go through Composio, not OpenClaw messaging channels.',
         '- For research tasks, assume the agent should use the available web or browser tools in the workspace before claiming a separate Brave Search API key is required.',
         '',
         `Task: ${taskRecord.message}`,
         operatorGuidance ? `Latest operator guidance: ${operatorGuidance}` : '',
         `Preferred assignee: ${preferredAgentId || 'none'}`,
         `Inferred requirements: ${JSON.stringify(effectiveRequirements)}`,
+        `Composio MCP configured for this workspace: ${composioConfigured ? 'yes' : 'no'}`,
         approvalGranted ? `Human approval already granted: ${JSON.stringify(taskRecord.approval)}` : '',
         `Team roster: ${JSON.stringify(roster.map((agent) => ({
             id: agent.id,
@@ -1524,6 +1545,8 @@ async function executeTaskRecord(instanceId, taskRecord) {
             approvalGranted ? 'Human approval has already been granted for this task. Do not return awaiting_approval solely because the task sends email or performs another already-approved action.' : '',
             'Mission Control app integrations are user-scoped through Composio MCP.',
             `When the user has connected ${COMPOSIO_RUNTIME_APPS.join(', ')} in Settings, use the Composio-backed tools in the workspace instead of looking for native channel configuration.`,
+            `Composio MCP configured for this workspace: ${composioConfigured ? 'yes' : 'no'}.`,
+            'Do not use the native `message` tool with channel `gmail`. That path is unrelated to Composio-backed Gmail.',
             'Do not report blockers like "Gmail channel not configured" unless the tool output explicitly shows the Composio connection is missing or still authorizing.',
             'For web research, use the available web and browser tools in the workspace before claiming a missing Brave Search API key or no browser access.',
             'Finish with ONLY valid JSON using this shape:',
@@ -1556,7 +1579,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
             message: workerPrompt
         });
         const outcome = parseTaskOutcome(workerRun.text);
-        const guard = inferExternalActionGuards({ requirements: effectiveRequirements, workerRun });
+        const guard = inferExternalActionGuards({ requirements: effectiveRequirements, workerRun, composioConfigured });
         const finishedAt = new Date().toISOString();
         const finalStatus = guard.status
             || (['completed', 'blocked', 'awaiting_connection', 'awaiting_approval', 'failed'].includes(outcome.status)
