@@ -1199,7 +1199,9 @@ function mapStoredTaskToJob(task, options = {}) {
         requiredCapabilities: normalizeTagList(task?.requiredCapabilities || []),
         requiredApps: normalizeTagList(task?.requiredApps || []),
         manager: task?.manager || null,
-        approval: task?.approval || null
+        approval: task?.approval || null,
+        operatorGuidance: String(task?.operatorGuidance || '').trim(),
+        operatorInputs: Array.isArray(task?.operatorInputs) ? task.operatorInputs : []
     };
 
     if (includeNarrative) metadata.narrative = narrative;
@@ -1228,6 +1230,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
     ensureManagerProfileForInstance(instanceId, config, { force: false });
     const roster = buildAgentRoster(instanceId, config);
     const requirements = inferTaskRequirements(taskRecord.message);
+    const operatorGuidance = String(taskRecord?.operatorGuidance || '').trim();
     const approvalGranted = String(taskRecord?.approval?.status || '').trim().toLowerCase() === 'approved';
     const effectiveRequirements = approvalGranted
         ? { ...requirements, needsApproval: false }
@@ -1249,6 +1252,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
         '- Never call a task completed at this stage. You are only routing it.',
         '',
         `Task: ${taskRecord.message}`,
+        operatorGuidance ? `Latest operator guidance: ${operatorGuidance}` : '',
         `Preferred assignee: ${preferredAgentId || 'none'}`,
         `Inferred requirements: ${JSON.stringify(effectiveRequirements)}`,
         approvalGranted ? `Human approval already granted: ${JSON.stringify(taskRecord.approval)}` : '',
@@ -1474,6 +1478,7 @@ async function executeTaskRecord(instanceId, taskRecord) {
             `Manager: ${MANAGER_IDENTITY_NAME}`,
             `Assigned agent: ${assignee?.label || managerDecision.agentId}`,
             `Task: ${taskRecord.message}`,
+            operatorGuidance ? `Latest operator guidance: ${operatorGuidance}` : '',
             `Manager reason: ${managerDecision.reason || 'Best fit for the task.'}`,
             `Required capabilities: ${(managerDecision.requiredCapabilities || effectiveRequirements.capabilities).join(', ') || 'general execution'}`,
             `Required apps: ${(managerDecision.requiredApps || effectiveRequirements.requiredApps).join(', ') || 'none explicitly required'}`,
@@ -3433,6 +3438,13 @@ app.post('/api/internal/tasks-action', requireInternal, async (req, res) => {
     const now = new Date().toISOString();
     const cleanedNote = String(note || '').trim();
     const currentStatus = String(existingTask.status || '').trim().toLowerCase();
+    const nextOperatorInputs = cleanedNote
+        ? [
+            ...(Array.isArray(existingTask.operatorInputs) ? existingTask.operatorInputs : []),
+            { ts: now, action, note: cleanedNote }
+        ]
+        : (Array.isArray(existingTask.operatorInputs) ? existingTask.operatorInputs : []);
+    const nextOperatorGuidance = cleanedNote || String(existingTask.operatorGuidance || '').trim();
 
     if (action === 'approve') {
         if (currentStatus !== 'awaiting_approval') {
@@ -3444,6 +3456,8 @@ app.post('/api/internal/tasks-action', requireInternal, async (req, res) => {
             status: 'triage',
             updatedAt: now,
             requestedAgentId: existingTask.assignedAgentId || existingTask.requestedAgentId || '',
+            operatorGuidance: nextOperatorGuidance,
+            operatorInputs: nextOperatorInputs,
             approval: {
                 status: 'approved',
                 approvedAt: now,
@@ -3468,6 +3482,8 @@ app.post('/api/internal/tasks-action', requireInternal, async (req, res) => {
             ...existingTask,
             status: 'triage',
             updatedAt: now,
+            operatorGuidance: nextOperatorGuidance,
+            operatorInputs: nextOperatorInputs,
             log: [
                 ...(existingTask.log || []),
                 { ts: now, role: 'system', text: cleanedNote ? `Task retried from Mission Control: ${cleanedNote}` : 'Task retried from Mission Control' }
@@ -3487,6 +3503,8 @@ app.post('/api/internal/tasks-action', requireInternal, async (req, res) => {
             ...existingTask,
             status: 'blocked',
             updatedAt: now,
+            operatorGuidance: nextOperatorGuidance,
+            operatorInputs: nextOperatorInputs,
             lastDecision: {
                 ts: now,
                 reason: cleanedNote || 'Operator rejected this task.'
