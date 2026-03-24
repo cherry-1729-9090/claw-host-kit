@@ -47,8 +47,6 @@ const MANAGER_AGENT_ID = 'main';
 const MANAGER_IDENTITY_NAME = 'Mission Manager';
 const CONTROL_UI_CLIENT_ID = 'openclaw-control-ui';
 const CONTROL_UI_OPERATOR_SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write'];
-const TRUSTED_PLUGIN_IDS = [MEM0_PLUGIN_KEY];
-
 const CONTAINER_RAM_LIMIT_MB = parseInt(process.env.OPENCLAW_CONTAINER_RAM_MB || '5120'); // 5 GB default
 
 // ── Request Logger (to file for container creation requests) ─────────────────
@@ -390,7 +388,18 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             console.warn(`[vps-agent] gateway token NOT found after ${TOKEN_POLL_TIMEOUT_MS / 1000}s for ${instanceId} — container may still be starting`);
         }
 
-        const mem0 = await ensureMem0ForInstance(instanceId);
+        let mem0;
+        try {
+            mem0 = await ensureMem0ForInstance(instanceId);
+        } catch (err) {
+            mem0 = { ok: false, installed: false, skipped: true, error: err.message };
+            const cleanupConfig = readInstanceConfig(instanceId);
+            if (cleanupConfig && stripMem0PluginConfig(cleanupConfig)) {
+                writeInstanceConfig(instanceId, cleanupConfig);
+                console.warn(`[vps-agent] removed broken Mem0 config for ${instanceId} after install failure`);
+            }
+            console.warn(`[vps-agent] Mem0 setup skipped for ${instanceId}: ${err.message}`);
+        }
         const composio = await ensureComposioForInstance(instanceId);
         const defaultModel = await ensureDefaultModelForInstance(instanceId);
         const managerConfig = readInstanceConfig(instanceId);
@@ -1706,15 +1715,19 @@ function sanitizeInstanceConfig(config) {
         changed = true;
     }
 
-    config.plugins = config.plugins || {};
-    const currentPluginAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
-    const nextPluginAllow = Array.from(new Set([
-        ...currentPluginAllow.map((value) => String(value || '').trim()).filter(Boolean),
-        ...TRUSTED_PLUGIN_IDS,
-    ]));
-    if (JSON.stringify(nextPluginAllow) !== JSON.stringify(currentPluginAllow)) {
-        config.plugins.allow = nextPluginAllow;
-        changed = true;
+    if (config.plugins && typeof config.plugins === 'object' && !Array.isArray(config.plugins)) {
+        const currentPluginAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
+        const nextPluginAllow = currentPluginAllow
+            .map((value) => String(value || '').trim())
+            .filter(Boolean);
+        if (JSON.stringify(nextPluginAllow) !== JSON.stringify(currentPluginAllow)) {
+            config.plugins.allow = nextPluginAllow;
+            changed = true;
+        }
+        if (Object.keys(config.plugins).length === 0) {
+            delete config.plugins;
+            changed = true;
+        }
     }
 
     const defaults = config.agents?.defaults;
@@ -1951,6 +1964,42 @@ function ensureMem0PluginConfig(config, instanceId) {
         || previousSlot !== MEM0_PLUGIN_KEY;
     config.plugins.entries[MEM0_PLUGIN_KEY] = next;
     config.plugins.slots.memory = MEM0_PLUGIN_KEY;
+    return changed;
+}
+
+function stripMem0PluginConfig(config) {
+    if (!config?.plugins || typeof config.plugins !== 'object' || Array.isArray(config.plugins)) return false;
+
+    let changed = false;
+
+    if (Array.isArray(config.plugins.allow)) {
+        const nextAllow = config.plugins.allow
+            .map((value) => String(value || '').trim())
+            .filter((value) => value && value !== MEM0_PLUGIN_KEY);
+        if (JSON.stringify(nextAllow) !== JSON.stringify(config.plugins.allow)) {
+            if (nextAllow.length > 0) config.plugins.allow = nextAllow;
+            else delete config.plugins.allow;
+            changed = true;
+        }
+    }
+
+    if (config.plugins.entries && typeof config.plugins.entries === 'object' && config.plugins.entries[MEM0_PLUGIN_KEY]) {
+        delete config.plugins.entries[MEM0_PLUGIN_KEY];
+        if (Object.keys(config.plugins.entries).length === 0) delete config.plugins.entries;
+        changed = true;
+    }
+
+    if (config.plugins.slots && typeof config.plugins.slots === 'object' && config.plugins.slots.memory === MEM0_PLUGIN_KEY) {
+        delete config.plugins.slots.memory;
+        if (Object.keys(config.plugins.slots).length === 0) delete config.plugins.slots;
+        changed = true;
+    }
+
+    if (Object.keys(config.plugins).length === 0) {
+        delete config.plugins;
+        changed = true;
+    }
+
     return changed;
 }
 
@@ -4121,32 +4170,26 @@ async function ensureMem0ForInstance(instanceId) {
     const alreadyInstalled = isMem0PluginInstalled(instanceId);
     let installedNow = false;
     if (!alreadyInstalled) {
-        config.plugins = config.plugins || {};
-        const currentAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
-        const nextAllow = Array.from(new Set([
-            ...currentAllow.map((value) => String(value || '').trim()).filter(Boolean),
-            MEM0_PLUGIN_KEY,
-        ]));
-        if (JSON.stringify(nextAllow) !== JSON.stringify(currentAllow)) {
-            config.plugins.allow = nextAllow;
-            writeInstanceConfig(instanceId, config);
-            console.log(`[vps-agent] pinned trusted plugins before Mem0 install for ${instanceId}`);
-        }
-        const currentSlot = config.plugins?.slots?.memory;
-        if (currentSlot === MEM0_PLUGIN_KEY) {
-            delete config.plugins.slots.memory;
-            if (config.plugins.slots && Object.keys(config.plugins.slots).length === 0) {
-                delete config.plugins.slots;
-            }
-            writeInstanceConfig(instanceId, config);
-            console.log(`[vps-agent] cleared Mem0 memory slot before install for ${instanceId}`);
-        }
         console.log(`[vps-agent] installing ${MEM0_PLUGIN_PACKAGE} in ${containerName}`);
         await runDockerExec(containerName, ['plugins', 'install', MEM0_PLUGIN_PACKAGE]);
         installedNow = true;
     }
 
-    const configChanged = ensureMem0PluginConfig(config, instanceId);
+    config.plugins = config.plugins || {};
+    const currentAllow = Array.isArray(config.plugins.allow) ? config.plugins.allow : [];
+    const nextAllow = Array.from(new Set([
+        ...currentAllow.map((value) => String(value || '').trim()).filter(Boolean),
+        MEM0_PLUGIN_KEY,
+    ]));
+    let configChanged = false;
+    if (JSON.stringify(nextAllow) !== JSON.stringify(currentAllow)) {
+        config.plugins.allow = nextAllow;
+        configChanged = true;
+    }
+
+    if (ensureMem0PluginConfig(config, instanceId)) {
+        configChanged = true;
+    }
     if (configChanged) {
         writeInstanceConfig(instanceId, config);
         console.log(`[vps-agent] wrote Mem0 config for ${instanceId}`);
