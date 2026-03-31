@@ -32,6 +32,8 @@ const MEM0_PLUGIN_PACKAGE = '@mem0/openclaw-mem0';
 const MEM0_PLUGIN_KEY = 'openclaw-mem0';
 const MEM0_ENV_PLACEHOLDER = '${MEM0_API_KEY}';
 const MEM0_API_KEY = process.env.OPENCLAW_MEM0_API_KEY || process.env.MEM0_API_KEY || '';
+const FIRECRAWL_API_KEY = process.env.OPENCLAW_FIRECRAWL_API_KEY || process.env.FIRECRAWL_API_KEY || '';
+const FIRECRAWL_CLI_PACKAGE = 'firecrawl-cli@latest';
 const COMPOSIO_SERVER_NAME = 'composio';
 const COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
 const COMPOSIO_HEADER_NAME = 'x-consumer-api-key';
@@ -401,6 +403,13 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             console.warn(`[vps-agent] Mem0 setup skipped for ${instanceId}: ${err.message}`);
         }
         const composio = await ensureComposioForInstance(instanceId);
+        let firecrawl;
+        try {
+            firecrawl = await ensureFirecrawlForInstance(instanceId);
+        } catch (err) {
+            firecrawl = { ok: false, installed: false, skipped: true, error: err.message };
+            console.warn(`[vps-agent] Firecrawl setup skipped for ${instanceId}: ${err.message}`);
+        }
         const defaultModel = await ensureDefaultModelForInstance(instanceId);
         const managerConfig = readInstanceConfig(instanceId);
         if (managerConfig) {
@@ -417,6 +426,7 @@ app.post('/api/internal/create-instance', requireInternal, async (req, res) => {
             gatewayToken,
             mem0,
             composio,
+            firecrawl,
             defaultModel,
             manager: { enabled: true, agentId: MANAGER_AGENT_ID, identity: MANAGER_IDENTITY_NAME },
             ramLimitMB: CONTAINER_RAM_LIMIT_MB,
@@ -771,7 +781,8 @@ function renderMissionControlRuntimeGuidanceLines() {
         `- For ${COMPOSIO_RUNTIME_APPS.join(', ')} tasks, use the Composio-backed tools in the workspace when the user connected the app in Settings.`,
         '- Do not report native-channel blockers like "Gmail channel not configured" unless a Composio tool explicitly proves the user connection is missing.',
         '- Do not use the native `message` tool for Gmail. That tool is for OpenClaw messaging channels, not Composio-backed inbox access.',
-        '- For web research, use the available web and browser tools in the workspace before assuming a separate Brave Search API key is required.',
+        '- For web research, search, scraping, crawling, extraction, and browser automation, prefer Firecrawl when it is available in the workspace.',
+        '- Firecrawl runs browser and scraping work remotely, so do not block on missing local Chromium or a separate Brave Search API key when Firecrawl is installed.',
         '- If a Composio tool returns "no connection found", "authentication in progress", or a similar auth error, then use awaiting_connection and name the missing app explicitly.'
     ];
 }
@@ -2142,6 +2153,22 @@ function runDockerExec(containerName, args, stdinData) {
 function runDockerExecDirect(containerName, args) {
     return new Promise((resolve, reject) => {
         const proc = execFile('docker', ['exec', containerName, ...args]);
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        proc.on('close', code => {
+            if (code !== 0) reject(new Error((stderr || stdout).trim().slice(0, 500)));
+            else resolve((stdout || stderr).trim());
+        });
+    });
+}
+
+function runDockerExecDirectWithEnv(containerName, envMap, args) {
+    const envArgs = Object.entries(envMap || {})
+        .filter(([key, value]) => key && value !== undefined && value !== null)
+        .flatMap(([key, value]) => ['-e', `${key}=${value}`]);
+    return new Promise((resolve, reject) => {
+        const proc = execFile('docker', ['exec', ...envArgs, containerName, ...args]);
         let stdout = '', stderr = '';
         proc.stdout.on('data', d => stdout += d);
         proc.stderr.on('data', d => stderr += d);
@@ -4151,6 +4178,65 @@ async function ensureMcporterInContainer(containerName) {
     }
 }
 
+async function ensureFirecrawlCliInContainer(containerName) {
+    let installedNow = false;
+    try {
+        await runDockerExecDirect(containerName, ['sh', '-lc', 'command -v firecrawl >/dev/null 2>&1 || test -x /home/node/.npm-global/bin/firecrawl']);
+    } catch {
+        console.log(`[vps-agent] installing ${FIRECRAWL_CLI_PACKAGE} in ${containerName}`);
+        await runDockerExecDirect(containerName, ['sh', '-lc', `npm install -g ${FIRECRAWL_CLI_PACKAGE}`]);
+        installedNow = true;
+    }
+
+    await runDockerExecAsRoot(containerName, ['sh', '-lc', 'if [ -x /home/node/.npm-global/bin/firecrawl ] && [ ! -e /usr/local/bin/firecrawl ]; then ln -sf /home/node/.npm-global/bin/firecrawl /usr/local/bin/firecrawl; fi']);
+
+    try {
+        await runDockerExecDirect(containerName, ['sh', '-lc', 'command -v firecrawl >/dev/null 2>&1']);
+        return installedNow;
+    } catch {
+        throw new Error('firecrawl-cli is installed but not executable via PATH');
+    }
+}
+
+async function ensureFirecrawlForInstance(instanceId) {
+    if (!validId(instanceId)) {
+        throw new Error('Invalid instanceId');
+    }
+    if (!FIRECRAWL_API_KEY) {
+        throw new Error('OPENCLAW_FIRECRAWL_API_KEY is not configured on the host');
+    }
+
+    const containerName = `openclaw-${instanceId}`;
+    const installedNow = await ensureFirecrawlCliInContainer(containerName);
+
+    await runDockerExecDirectWithEnv(containerName, { FIRECRAWL_API_KEY }, [
+        'sh',
+        '-lc',
+        'firecrawl login --api-key "$FIRECRAWL_API_KEY" >/dev/null 2>&1'
+    ]);
+
+    await runDockerExecDirectWithEnv(containerName, { FIRECRAWL_API_KEY }, [
+        'sh',
+        '-lc',
+        'firecrawl init skills >/dev/null 2>&1'
+    ]);
+
+    const status = await runDockerExecDirectWithEnv(containerName, { FIRECRAWL_API_KEY }, [
+        'sh',
+        '-lc',
+        'firecrawl --status 2>/dev/null || firecrawl view-config 2>/dev/null || true'
+    ]);
+
+    return {
+        ok: true,
+        installed: true,
+        installedNow,
+        authenticated: true,
+        skillInstalled: true,
+        status: String(status || '').trim(),
+    };
+}
+
 async function ensureMem0ForInstance(instanceId) {
     if (!validId(instanceId)) {
         throw new Error('Invalid instanceId');
@@ -4258,6 +4344,20 @@ app.post('/api/internal/composio-ensure', requireInternal, async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error(`[vps-agent] composio-ensure failed for ${instanceId}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/internal/firecrawl-ensure', requireInternal, async (req, res) => {
+    const { instanceId } = req.body;
+    if (!instanceId) {
+        return res.status(400).json({ error: 'instanceId is required' });
+    }
+    try {
+        const result = await ensureFirecrawlForInstance(instanceId);
+        res.json(result);
+    } catch (err) {
+        console.error(`[vps-agent] firecrawl-ensure failed for ${instanceId}:`, err.message);
         res.status(500).json({ error: err.message });
     }
 });
